@@ -121,4 +121,4 @@ spec:
     - port: 5432
       targetPort: 5432
       name: postgres
-  clusterIP: None   # Headless for StatefulSet DNS
+  type: ClusterIP   # Headless for StatefulSet DNS

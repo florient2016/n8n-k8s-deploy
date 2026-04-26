@@ -64,6 +64,18 @@ spec:
         runAsUser: 1000
         fsGroup: 1000
 
+      # Co-locate with n8n-main so the RWO n8n-data-pvc is accessible.
+      # RWO volumes can only be mounted on ONE node at a time.
+      # Remove this block if you switch to an RWX StorageClass.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: n8n
+                  component: main
+              topologyKey: kubernetes.io/hostname
+
       initContainers:
         - name: wait-for-vault-secrets
           image: busybox:1.36

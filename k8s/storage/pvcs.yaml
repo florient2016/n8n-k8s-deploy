@@ -17,6 +17,12 @@ spec:
   storageClassName: standard   # ← replace with your StorageClass (e.g. gp2, longhorn, etc.)
 ---
 # n8n-data-pvc: n8n user data & .n8n folder
+# Using ReadWriteOnce — compatible with the 'standard' StorageClass.
+# CONSEQUENCE: n8n-main and n8n-worker pods must be scheduled on the SAME node.
+# The n8n-worker deployment uses podAffinity (see n8n-worker.yaml) to enforce this.
+# If you later add an RWX StorageClass (NFS, Longhorn RWX, AWS EFS):
+#   1. Delete this PVC:  kubectl delete pvc n8n-data-pvc -n n8n
+#   2. Update accessModes to ReadWriteMany and re-apply.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -27,11 +33,11 @@ metadata:
     app.kubernetes.io/part-of: n8n
 spec:
   accessModes:
-    - ReadWriteMany   # needed if main + workers share the volume
+    - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
-  storageClassName: standard   # ← use an RWX-capable StorageClass (NFS, EFS, Longhorn, etc.)
+      storage: 5Gi
+  storageClassName: standard
 ---
 # n8n-redis-pvc: Redis RDB / AOF persistence
 apiVersion: v1
@@ -47,5 +53,5 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 5Gi
+      storage: 2Gi
   storageClassName: standard
