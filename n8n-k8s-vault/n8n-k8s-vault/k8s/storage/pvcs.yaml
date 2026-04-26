@@ -1,0 +1,51 @@
+---
+# n8n-postgres-pvc: PostgreSQL data directory
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-postgres-pvc
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: n8n
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: standard   # ← replace with your StorageClass (e.g. gp2, longhorn, etc.)
+---
+# n8n-data-pvc: n8n user data & .n8n folder
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-data-pvc
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/part-of: n8n
+spec:
+  accessModes:
+    - ReadWriteMany   # needed if main + workers share the volume
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard   # ← use an RWX-capable StorageClass (NFS, EFS, Longhorn, etc.)
+---
+# n8n-redis-pvc: Redis RDB / AOF persistence
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-redis-pvc
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: n8n
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard

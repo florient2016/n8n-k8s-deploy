@@ -1,0 +1,103 @@
+{
+  "name": "01 - Article Topic Input",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "submit-topic",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook: Receive Topic",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "id": "webhook-receive-topic",
+      "notes": "POST /webhook/submit-topic\nBody: { \"topic\": \"...\", \"notes\": \"...\", \"priority\": 5 }"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.body.topic }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [480, 300],
+      "id": "validate-input"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO article_topics (topic, notes, priority, status)\nVALUES (\n  '{{ $json.body.topic.replace(/'/g, \"''\") }}',\n  '{{ ($json.body.notes || '').replace(/'/g, \"''\") }}',\n  {{ $json.body.priority || 5 }},\n  'pending'\n)\nRETURNING id, topic, created_at;",
+        "options": {}
+      },
+      "name": "Insert Topic to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [720, 200],
+      "id": "insert-topic",
+      "credentials": {
+        "postgres": {
+          "name": "n8n-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, message: 'Topic queued successfully', id: $json[0].id, topic: $json[0].topic, created_at: $json[0].created_at }) }}",
+        "options": {
+          "responseCode": 201
+        }
+      },
+      "name": "Respond: Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [960, 200],
+      "id": "respond-success"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"success\": false, \"error\": \"topic field is required\"}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "name": "Respond: Bad Request",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [720, 440],
+      "id": "respond-bad-request"
+    }
+  ],
+  "connections": {
+    "Webhook: Receive Topic": {
+      "main": [
+        [{ "node": "Validate Input", "type": "main", "index": 0 }]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [{ "node": "Insert Topic to DB", "type": "main", "index": 0 }],
+        [{ "node": "Respond: Bad Request", "type": "main", "index": 0 }]
+      ]
+    },
+    "Insert Topic to DB": {
+      "main": [
+        [{ "node": "Respond: Success", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["article-automation", "input"]
+}

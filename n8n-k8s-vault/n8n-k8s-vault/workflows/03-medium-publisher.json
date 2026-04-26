@@ -1,0 +1,150 @@
+{
+  "name": "03 - Optional Medium Publisher",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "publish-to-medium",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook: Trigger Medium Publish",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "id": "webhook-medium",
+      "notes": "POST /webhook/publish-to-medium\nBody: { \"topic_id\": 123, \"article_content\": \"...\", \"article_title\": \"...\" }"
+    },
+    {
+      "parameters": {
+        "url": "https://api.medium.com/v1/me",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.MEDIUM_TOKEN }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Get Medium User ID",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [480, 300],
+      "id": "get-medium-user"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.medium.com/v1/users/{{ $json.data.id }}/posts",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.MEDIUM_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "title",
+              "value": "={{ $node['Webhook: Trigger Medium Publish'].json.body.article_title }}"
+            },
+            {
+              "name": "contentFormat",
+              "value": "markdown"
+            },
+            {
+              "name": "content",
+              "value": "={{ $node['Webhook: Trigger Medium Publish'].json.body.article_content }}"
+            },
+            {
+              "name": "publishStatus",
+              "value": "draft"
+            },
+            {
+              "name": "tags",
+              "value": "=[\"kubernetes\", \"devops\", \"cloud\"]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Create Medium Draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [720, 300],
+      "id": "create-medium-draft"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE article_topics\nSET article_url = '{{ $json.data.url }}'\nWHERE id = {{ $node['Webhook: Trigger Medium Publish'].json.body.topic_id }};",
+        "options": {}
+      },
+      "name": "Save Medium URL to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [960, 300],
+      "id": "save-medium-url",
+      "credentials": {
+        "postgres": {
+          "name": "n8n-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, medium_url: $node['Create Medium Draft'].json.data.url, status: 'draft' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Respond: Medium Draft Created",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1200, 300],
+      "id": "respond-medium-success"
+    }
+  ],
+  "connections": {
+    "Webhook: Trigger Medium Publish": {
+      "main": [
+        [{ "node": "Get Medium User ID", "type": "main", "index": 0 }]
+      ]
+    },
+    "Get Medium User ID": {
+      "main": [
+        [{ "node": "Create Medium Draft", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Medium Draft": {
+      "main": [
+        [{ "node": "Save Medium URL to DB", "type": "main", "index": 0 }]
+      ]
+    },
+    "Save Medium URL to DB": {
+      "main": [
+        [{ "node": "Respond: Medium Draft Created", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["article-automation", "medium", "optional"]
+}

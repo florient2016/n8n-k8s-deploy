@@ -1,0 +1,66 @@
+---
+# Service Account used by all n8n pods.
+# Vault Agent sidecar will authenticate using this SA.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: n8n-sa
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/part-of: n8n
+  annotations:
+    # Optional: if you later adopt IRSA / Workload Identity, add annotations here
+    vault.hashicorp.com/role: "n8n-role"
+---
+# Role: allow n8n to read its own secrets (Vault-injected) and manage configmaps
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: n8n-role
+  namespace: n8n
+  labels:
+    app.kubernetes.io/part-of: n8n
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: n8n-rolebinding
+  namespace: n8n
+  labels:
+    app.kubernetes.io/part-of: n8n
+subjects:
+  - kind: ServiceAccount
+    name: n8n-sa
+    namespace: n8n
+roleRef:
+  kind: Role
+  apiGroup: rbac.authorization.k8s.io
+  name: n8n-role
+---
+# TokenReview ClusterRole — needed for Vault Kubernetes auth method
+# (Vault uses this to validate SA JWTs presented by pods)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-auth-delegator
+  labels:
+    app.kubernetes.io/part-of: n8n
+subjects:
+  - kind: ServiceAccount
+    name: vault           # The Vault SA in the vault namespace
+    namespace: vault
+roleRef:
+  kind: ClusterRole
+  apiGroup: rbac.authorization.k8s.io
+  name: system:auth-delegator
