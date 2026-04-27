@@ -1,0 +1,144 @@
+---
+# =============================================================================
+# n8n Redis ConfigMap — Non-sensitive Redis configuration
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: n8n-redis-config
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/component: redis
+data:
+  redis.conf: |
+    # Persistence
+    appendonly yes
+    appendfsync everysec
+    save 900 1
+    save 300 10
+    save 60 10000
+    # Memory
+    maxmemory 512mb
+    maxmemory-policy allkeys-lru
+    # Connection
+    tcp-keepalive 60
+    timeout 0
+    # Bind to all interfaces inside pod
+    bind 0.0.0.0
+    protected-mode no
+
+---
+# =============================================================================
+# n8n Redis Service
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: n8n-redis
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/component: redis
+spec:
+  selector:
+    app: n8n-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+  clusterIP: None   # Headless for StatefulSet
+
+---
+# =============================================================================
+# n8n Redis StatefulSet with Vault Agent injection for password
+# =============================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: n8n-redis
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: n8n-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: n8n-redis
+  template:
+    metadata:
+      labels:
+        app: n8n-redis
+        app.kubernetes.io/name: n8n
+        app.kubernetes.io/component: redis
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "n8n"
+        vault.hashicorp.com/agent-inject-secret-redis: "secret/data/n8n/redis"
+        vault.hashicorp.com/agent-inject-template-redis: |
+          {{- with secret "secret/data/n8n/redis" -}}
+          {{ .Data.data.REDIS_PASSWORD }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+    spec:
+      serviceAccountName: n8n-sa
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              REDIS_PASSWORD=$(cat /vault/secrets/redis | tr -d '[:space:]')
+              exec redis-server /etc/redis/redis.conf --requirepass "${REDIS_PASSWORD}"
+          ports:
+            - containerPort: 6379
+              name: redis
+          volumeMounts:
+            - name: n8n-redis-data
+              mountPath: /data
+            - name: redis-config
+              mountPath: /etc/redis
+            - name: vault-secrets
+              mountPath: /vault/secrets
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  REDIS_PASSWORD=$(cat /vault/secrets/redis | tr -d '[:space:]')
+                  redis-cli -a "${REDIS_PASSWORD}" ping
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  REDIS_PASSWORD=$(cat /vault/secrets/redis | tr -d '[:space:]')
+                  redis-cli -a "${REDIS_PASSWORD}" ping
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: n8n-redis-data
+          persistentVolumeClaim:
+            claimName: n8n-redis-pvc
+        - name: redis-config
+          configMap:
+            name: n8n-redis-config
+        - name: vault-secrets
+          emptyDir: {}

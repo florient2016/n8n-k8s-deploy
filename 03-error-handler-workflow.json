@@ -1,0 +1,68 @@
+{
+  "name": "03 - Error Handler Workflow",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE article_topics\nSET status = 'error',\n    retry_count = retry_count + 1,\n    error_message = '{{ $json.execution.error.message.replace(/'/g, \"''\").substring(0, 500) }}',\n    processed_at = NOW()\nWHERE status = 'processing'\n  AND scheduled_at > NOW() - INTERVAL '2 hours';",
+        "options": {}
+      },
+      "id": "postgres-mark-error",
+      "name": "PostgreSQL - Mark Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-creds",
+          "name": "n8n PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "n8n Error <your-email@gmail.com>",
+        "toEmail": "your-email@gmail.com",
+        "subject": "=[n8n] Workflow Error: {{ $json.workflow.name }}",
+        "emailType": "html",
+        "html": "<h2>⚠️ n8n Workflow Error</h2>\n<table style='border-collapse:collapse;width:100%'>\n  <tr><td style='padding:8px;border:1px solid #ddd;font-weight:bold'>Workflow</td><td style='padding:8px;border:1px solid #ddd'>{{ $json.workflow.name }}</td></tr>\n  <tr><td style='padding:8px;border:1px solid #ddd;font-weight:bold'>Execution ID</td><td style='padding:8px;border:1px solid #ddd'>{{ $json.execution.id }}</td></tr>\n  <tr><td style='padding:8px;border:1px solid #ddd;font-weight:bold'>Node</td><td style='padding:8px;border:1px solid #ddd'>{{ $json.execution.lastNodeExecuted }}</td></tr>\n  <tr><td style='padding:8px;border:1px solid #ddd;font-weight:bold'>Error</td><td style='padding:8px;border:1px solid #ddd;color:red'>{{ $json.execution.error.message }}</td></tr>\n  <tr><td style='padding:8px;border:1px solid #ddd;font-weight:bold'>Time</td><td style='padding:8px;border:1px solid #ddd'>{{ new Date().toISOString() }}</td></tr>\n</table>\n<p><a href='https://n8n.YOUR_DOMAIN.com/executions/{{ $json.execution.id }}'>View Execution in n8n</a></p>",
+        "options": {}
+      },
+      "id": "email-error-alert",
+      "name": "Email - Error Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "credentials": {
+        "smtp": {
+          "id": "smtp-creds",
+          "name": "SMTP Gmail"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [{ "node": "PostgreSQL - Mark Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "PostgreSQL - Mark Error": {
+      "main": [
+        [{ "node": "Email - Error Alert", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["error-handling"]
+}

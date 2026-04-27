@@ -1,0 +1,70 @@
+---
+# =============================================================================
+# ServiceAccount for n8n pods
+# Vault Agent Injector uses this SA to authenticate with Vault
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: n8n-sa
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/component: serviceaccount
+  annotations:
+    vault.hashicorp.com/role: "n8n"
+
+---
+# =============================================================================
+# ClusterRoleBinding: Allow Vault token reviewer to validate n8n SA tokens
+# =============================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: n8n-vault-token-reviewer
+  labels:
+    app.kubernetes.io/name: n8n
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: n8n-sa
+    namespace: n8n
+
+---
+# =============================================================================
+# Role: n8n operational permissions within its namespace
+# =============================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: n8n-role
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: n8n-rolebinding
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: n8n-role
+subjects:
+  - kind: ServiceAccount
+    name: n8n-sa
+    namespace: n8n

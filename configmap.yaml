@@ -1,0 +1,57 @@
+---
+# =============================================================================
+# n8n ConfigMap — Non-sensitive application configuration
+# Sensitive values (passwords, keys) are injected by Vault Agent
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: n8n-config
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/component: config
+data:
+  # ── Core ────────────────────────────────────────────────────────────────────
+  NODE_ENV: "production"
+  GENERIC_TIMEZONE: "Europe/Berlin"        # ← Change to your timezone
+  N8N_HOST: "n8n.example.com"             # ← Change to your domain
+  N8N_PORT: "5678"
+  N8N_PROTOCOL: "https"
+  WEBHOOK_URL: "https://n8n.example.com"  # ← Change to your domain
+
+  # ── Execution Mode (Queue) ──────────────────────────────────────────────────
+  EXECUTIONS_MODE: "queue"
+  QUEUE_BULL_REDIS_HOST: "n8n-redis-0.n8n-redis.n8n.svc.cluster.local"
+  QUEUE_BULL_REDIS_PORT: "6379"
+
+  # ── Database ────────────────────────────────────────────────────────────────
+  DB_TYPE: "postgresdb"
+  DB_POSTGRESDB_HOST: "n8n-postgres-0.n8n-postgres.n8n.svc.cluster.local"
+  DB_POSTGRESDB_PORT: "5432"
+  DB_POSTGRESDB_DATABASE: "n8n"
+  DB_POSTGRESDB_USER: "n8n"
+  # DB_POSTGRESDB_PASSWORD injected by Vault Agent
+
+  # ── Email (SMTP) ─────────────────────────────────────────────────────────────
+  # Credentials injected by Vault Agent; these are non-sensitive settings
+  N8N_EMAIL_MODE: "smtp"
+  N8N_SMTP_HOST: "smtp.gmail.com"
+  N8N_SMTP_PORT: "465"
+  N8N_SMTP_SSL: "true"
+
+  # ── Security ────────────────────────────────────────────────────────────────
+  N8N_SECURE_COOKIE: "true"
+  N8N_SKIP_WEBHOOK_DEREGISTRATION_SHUTDOWN: "false"
+
+  # ── Logging ─────────────────────────────────────────────────────────────────
+  N8N_LOG_LEVEL: "info"
+  N8N_LOG_OUTPUT: "console"
+
+  # ── Workers ─────────────────────────────────────────────────────────────────
+  EXECUTIONS_PROCESS: "main"
+  N8N_CONCURRENCY_PRODUCTION_LIMIT: "10"
+
+  # ── Metrics ─────────────────────────────────────────────────────────────────
+  N8N_METRICS: "true"
+  N8N_METRICS_PREFIX: "n8n_"

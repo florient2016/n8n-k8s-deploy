@@ -1,0 +1,56 @@
+---
+# =============================================================================
+# k8s/vault-agent/vault-agent-configmap.yaml
+# Reference Vault Agent ConfigMap (optional — used for explicit agent deployments)
+# The Vault Agent Injector generates config automatically from pod annotations.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-agent-config
+  namespace: n8n
+  labels:
+    app.kubernetes.io/part-of: n8n
+data:
+  vault-agent-config.hcl: |
+    exit_after_auth = false
+    pid_file = "/vault/agent/pidfile"
+
+    auto_auth {
+      method "kubernetes" {
+        mount_path = "auth/kubernetes"
+        config = {
+          role = "n8n"
+        }
+      }
+      sink "file" {
+        config = {
+          path = "/vault/agent/.vault-token"
+        }
+      }
+    }
+
+    vault {
+      address = "http://vault.vault.svc.cluster.local:8200"
+    }
+
+    template {
+      source      = "/vault/templates/postgres.ctmpl"
+      destination = "/vault/secrets/postgres"
+      perms       = "0400"
+    }
+    template {
+      source      = "/vault/templates/redis.ctmpl"
+      destination = "/vault/secrets/redis"
+      perms       = "0400"
+    }
+    template {
+      source      = "/vault/templates/core.ctmpl"
+      destination = "/vault/secrets/core"
+      perms       = "0400"
+    }
+    template {
+      source      = "/vault/templates/smtp.ctmpl"
+      destination = "/vault/secrets/smtp"
+      perms       = "0400"
+    }

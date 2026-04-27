@@ -1,0 +1,12 @@
+---
+# =============================================================================
+# n8n Namespace
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: n8n
+  labels:
+    name: n8n
+    app.kubernetes.io/managed-by: kubectl
+    vault.hashicorp.com/agent-inject: "true"

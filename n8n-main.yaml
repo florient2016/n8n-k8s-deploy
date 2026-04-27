@@ -1,0 +1,184 @@
+---
+# =============================================================================
+# n8n Service — Main application service
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: n8n
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/component: main
+spec:
+  selector:
+    app: n8n
+    role: main
+  ports:
+    - name: http
+      port: 80
+      targetPort: 5678
+    - name: metrics
+      port: 9100
+      targetPort: 9100
+  type: ClusterIP
+
+---
+# =============================================================================
+# n8n Main Deployment
+# Vault Agent sidecar injects all secrets as rendered env-var export files.
+# An init container sources them before the n8n process starts.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: n8n
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/component: main
+    app.kubernetes.io/version: "latest"
+spec:
+  replicas: 1   # Main instance = 1 (workers handle concurrency)
+  selector:
+    matchLabels:
+      app: n8n
+      role: main
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: n8n
+        role: main
+        app.kubernetes.io/name: n8n
+        app.kubernetes.io/component: main
+      annotations:
+        # ── Vault Agent Injector ─────────────────────────────────────────────
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "n8n"
+
+        # Core secret (encryption key)
+        vault.hashicorp.com/agent-inject-secret-core: "secret/data/n8n/core"
+        vault.hashicorp.com/agent-inject-template-core: |
+          {{- with secret "secret/data/n8n/core" -}}
+          export N8N_ENCRYPTION_KEY="{{ .Data.data.N8N_ENCRYPTION_KEY }}"
+          {{- end }}
+
+        # PostgreSQL
+        vault.hashicorp.com/agent-inject-secret-postgres: "secret/data/n8n/postgres"
+        vault.hashicorp.com/agent-inject-template-postgres: |
+          {{- with secret "secret/data/n8n/postgres" -}}
+          export DB_POSTGRESDB_PASSWORD="{{ .Data.data.POSTGRES_PASSWORD }}"
+          {{- end }}
+
+        # Redis
+        vault.hashicorp.com/agent-inject-secret-redis: "secret/data/n8n/redis"
+        vault.hashicorp.com/agent-inject-template-redis: |
+          {{- with secret "secret/data/n8n/redis" -}}
+          export QUEUE_BULL_REDIS_PASSWORD="{{ .Data.data.REDIS_PASSWORD }}"
+          {{- end }}
+
+        # SMTP
+        vault.hashicorp.com/agent-inject-secret-smtp: "secret/data/n8n/smtp"
+        vault.hashicorp.com/agent-inject-template-smtp: |
+          {{- with secret "secret/data/n8n/smtp" -}}
+          export N8N_SMTP_USER="{{ .Data.data.SMTP_USER }}"
+          export N8N_SMTP_PASS="{{ .Data.data.SMTP_PASSWORD }}"
+          export N8N_SMTP_SENDER="{{ .Data.data.SMTP_FROM }}"
+          {{- end }}
+
+        # LLM API Key
+        vault.hashicorp.com/agent-inject-secret-llm: "secret/data/n8n/llm"
+        vault.hashicorp.com/agent-inject-template-llm: |
+          {{- with secret "secret/data/n8n/llm" -}}
+          export LLM_API_KEY="{{ .Data.data.LLM_API_KEY }}"
+          {{- end }}
+
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-run-as-user: "1000"
+    spec:
+      serviceAccountName: n8n-sa
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        # Wait for PostgreSQL to be ready
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until nc -z n8n-postgres-0.n8n-postgres.n8n.svc.cluster.local 5432; do
+                echo "Waiting for PostgreSQL..."
+                sleep 2
+              done
+              echo "PostgreSQL is ready."
+        # Wait for Redis to be ready
+        - name: wait-for-redis
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until nc -z n8n-redis-0.n8n-redis.n8n.svc.cluster.local 6379; do
+                echo "Waiting for Redis..."
+                sleep 2
+              done
+              echo "Redis is ready."
+      containers:
+        - name: n8n
+          image: n8nio/n8n:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Source all Vault-injected secrets
+              for f in /vault/secrets/*; do
+                [ -f "$f" ] && . "$f"
+              done
+              # Start n8n
+              exec n8n start
+          envFrom:
+            - configMapRef:
+                name: n8n-config
+          ports:
+            - name: http
+              containerPort: 5678
+          volumeMounts:
+            - name: n8n-data
+              mountPath: /home/node/.n8n
+            - name: vault-secrets
+              mountPath: /vault/secrets
+              readOnly: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 5678
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 5678
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+      volumes:
+        - name: n8n-data
+          persistentVolumeClaim:
+            claimName: n8n-data-pvc
+        - name: vault-secrets
+          emptyDir: {}

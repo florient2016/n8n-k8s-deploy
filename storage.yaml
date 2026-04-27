@@ -1,0 +1,165 @@
+---
+# =============================================================================
+# k8s/storage/storageclass.yaml
+# Local volume StorageClass for n8n workloads
+# Mounts on host path /n8n (create this directory on your nodes first)
+# =============================================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+  labels:
+    app.kubernetes.io/part-of: n8n
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+
+---
+# =============================================================================
+# PersistentVolumes — local mounts from /n8n on the node
+# Adjust the nodeSelectorTerms hostname to your actual node name
+# =============================================================================
+
+# n8n application data PV
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: n8n-data-pv
+  labels:
+    app.kubernetes.io/part-of: n8n
+    storage-for: n8n-data
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  local:
+    path: /n8n/data
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - YOUR_NODE_NAME   # ← replace with your node name
+
+---
+# PostgreSQL data PV
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: n8n-postgres-pv
+  labels:
+    app.kubernetes.io/part-of: n8n
+    storage-for: n8n-postgres
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  local:
+    path: /n8n/postgres
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - YOUR_NODE_NAME   # ← replace with your node name
+
+---
+# Redis data PV
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: n8n-redis-pv
+  labels:
+    app.kubernetes.io/part-of: n8n
+    storage-for: n8n-redis
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  local:
+    path: /n8n/redis
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - YOUR_NODE_NAME   # ← replace with your node name
+
+---
+# =============================================================================
+# PersistentVolumeClaims
+# =============================================================================
+
+# n8n application data PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-data-pvc
+  namespace: n8n
+  labels:
+    app.kubernetes.io/part-of: n8n
+spec:
+  storageClassName: standard
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  selector:
+    matchLabels:
+      storage-for: n8n-data
+
+---
+# PostgreSQL data PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-postgres-pvc
+  namespace: n8n
+  labels:
+    app.kubernetes.io/part-of: n8n
+spec:
+  storageClassName: standard
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  selector:
+    matchLabels:
+      storage-for: n8n-postgres
+
+---
+# Redis data PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-redis-pvc
+  namespace: n8n
+  labels:
+    app.kubernetes.io/part-of: n8n
+spec:
+  storageClassName: standard
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  selector:
+    matchLabels:
+      storage-for: n8n-redis
