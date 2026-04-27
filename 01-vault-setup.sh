@@ -27,17 +27,63 @@ VAULT_SA_JWT=$(kubectl exec -n vault vault-0 -- \
   cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 echo "  JWT (first 50 chars): ${VAULT_SA_JWT:0:50}..."
 
-# ─── 2. Prompt for secrets ────────────────────────────────────────────────────
+# ─── 2. Collect secrets from environment variables ───────────────────────────
 echo ""
-echo "[3/8] Collecting secret values (input hidden where possible)..."
+echo "[3/8] Collecting secret values from environment variables..."
+echo "      (Set these before running to avoid interactive prompts)"
+echo ""
+echo "  Required env vars:"
+echo "    export VAULT_ROOT_TOKEN=..."
+echo "    export N8N_ENCRYPTION_KEY=..."
+echo "    export POSTGRES_PASSWORD=..."
+echo "    export REDIS_PASSWORD=..."
+echo "    export SMTP_PASSWORD=..."
+echo "    export LLM_API_KEY=..."
+echo "    export MEDIUM_TOKEN=...   (optional)"
+echo ""
 
-read -rp  "  Vault ROOT_TOKEN: " -s VAULT_ROOT_TOKEN; echo ""
-read -rp  "  n8n Encryption Key (32+ chars, random): " -s N8N_ENCRYPTION_KEY; echo ""
-read -rp  "  PostgreSQL password: " -s POSTGRES_PASSWORD; echo ""
-read -rp  "  Redis password: " -s REDIS_PASSWORD; echo ""
-read -rp  "  SMTP password (or Gmail App Password): " -s SMTP_PASSWORD; echo ""
-read -rp  "  LLM API Key (OpenAI/Anthropic/etc): " -s LLM_API_KEY; echo ""
-read -rp  "  Medium Integration Token (leave blank to skip): " -s MEDIUM_TOKEN; echo ""
+# Helper: read from env var or fall back to hidden prompt
+require_secret() {
+  local var_name="$1"
+  local prompt_label="$2"
+  local value="${!var_name:-}"
+
+  if [[ -n "${value}" ]]; then
+    echo "  ✓ ${var_name} loaded from environment"
+  else
+    read -rp "  ${prompt_label}: " -s value; echo ""
+    if [[ -z "${value}" ]]; then
+      echo "  ERROR: ${var_name} is required but was not provided." >&2
+      exit 1
+    fi
+  fi
+  # Export back so callers can use it
+  export "${var_name}=${value}"
+}
+
+optional_secret() {
+  local var_name="$1"
+  local prompt_label="$2"
+  local value="${!var_name:-}"
+
+  if [[ -n "${value}" ]]; then
+    echo "  ✓ ${var_name} loaded from environment"
+  else
+    read -rp "  ${prompt_label} (leave blank to skip): " -s value; echo ""
+    export "${var_name}=${value:-DISABLED}"
+  fi
+}
+
+require_secret  VAULT_ROOT_TOKEN    "Vault ROOT_TOKEN"
+require_secret  N8N_ENCRYPTION_KEY  "n8n Encryption Key (32+ chars)"
+require_secret  POSTGRES_PASSWORD   "PostgreSQL password"
+require_secret  REDIS_PASSWORD      "Redis password"
+require_secret  SMTP_PASSWORD       "SMTP / Gmail App Password"
+require_secret  LLM_API_KEY         "LLM API Key (OpenAI/Anthropic/etc)"
+optional_secret MEDIUM_TOKEN        "Medium Integration Token"
+
+echo ""
+echo "  All secrets collected."
 
 # ─── 3. Enable Vault KV secrets engine ───────────────────────────────────────
 echo ""

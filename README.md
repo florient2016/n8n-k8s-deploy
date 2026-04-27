@@ -169,6 +169,14 @@ n8n-k8s/
 
 ### Step 1: Run Vault Setup Script
 
+export VAULT_ROOT_TOKEN="hvs.xxxxxxxxxxxx"
+export N8N_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+export POSTGRES_PASSWORD="$(openssl rand -base64 24)"
+export REDIS_PASSWORD="$(openssl rand -base64 24)"
+export SMTP_PASSWORD="your-gmail-app-password"
+export LLM_API_KEY="sk-proj-xxxxxxxxxxxx"
+export MEDIUM_TOKEN="your-medium-token"   # omit entirely to skip
+
 ```bash
 chmod +x vault/01-vault-setup.sh
 ./vault/01-vault-setup.sh
