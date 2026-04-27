@@ -1,118 +1,156 @@
 #!/usr/bin/env bash
 # =============================================================================
-# n8n Kubernetes Deployment Script
-# Prerequisites:
-#   - kubectl configured and pointed at your cluster
-#   - Vault already set up (run vault/vault-setup.sh first)
-#   - Vault Agent Injector installed in the cluster
-#   - cert-manager installed (for TLS)
-#   - nginx ingress controller installed
+# Master Deploy Script: n8n on Kubernetes with HashiCorp Vault
+# Run AFTER vault/01-vault-setup.sh
 # =============================================================================
 set -euo pipefail
 
 NAMESPACE="n8n"
-DOMAIN="${DOMAIN:-n8n.example.com}"  # Override: DOMAIN=n8n.mycompany.com ./deploy.sh
+KUBECTL="kubectl"
 
-echo "============================================================"
-echo " n8n Kubernetes Deployment"
-echo " Domain: ${DOMAIN}"
-echo "============================================================"
+echo "========================================="
+echo "  n8n Kubernetes Deployment"
+echo "  Namespace: ${NAMESPACE}"
+echo "========================================="
 
-# Replace placeholder domain in all manifests
+# ---------------------------------------------------------------------------
+# Pre-flight: check required tools
+# ---------------------------------------------------------------------------
 echo ""
-echo "[Setup] Replacing placeholder domain with: ${DOMAIN}"
-find k8s/ -name "*.yaml" -exec sed -i "s/n8n\.example\.com/${DOMAIN}/g" {} \;
+echo "[0] Pre-flight checks..."
+for tool in kubectl; do
+  command -v "$tool" &>/dev/null || { echo "ERROR: '$tool' not found in PATH"; exit 1; }
+done
 
-# Replace placeholder email
-if [ -n "${ADMIN_EMAIL:-}" ]; then
-  find k8s/ -name "*.yaml" -exec sed -i "s/your-email@example\.com/${ADMIN_EMAIL}/g" {} \;
-  find workflows/ -name "*.json" -exec sed -i "s/your-email@example\.com/${ADMIN_EMAIL}/g" {} \;
-fi
+# Check Vault is reachable
+kubectl get pod -n vault vault-0 --no-headers &>/dev/null || {
+  echo "ERROR: vault-0 pod not found in vault namespace"
+  exit 1
+}
+echo "  All pre-flight checks passed."
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Step 1: Create namespace
+# ---------------------------------------------------------------------------
 echo ""
-echo "[1/8] Creating namespace..."
-kubectl apply -f k8s/namespace/namespace.yaml
+echo "[1] Creating namespace..."
+kubectl apply -f namespace.yaml
+echo "  Namespace '${NAMESPACE}' ready."
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Step 2: Create host directories (run this on each node)
+# ---------------------------------------------------------------------------
 echo ""
-echo "[2/8] Creating RBAC resources..."
-kubectl apply -f k8s/rbac/rbac.yaml
+echo "[2] Host directory setup..."
+echo "  NOTE: Run scripts/create-host-dirs.sh on each Kubernetes node"
+echo "  that will host n8n workloads before continuing."
+echo "  Press Enter when done, or Ctrl+C to cancel."
+read -r
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Step 3: RBAC
+# ---------------------------------------------------------------------------
 echo ""
-echo "[3/8] Creating PersistentVolumeClaims..."
-kubectl apply -f k8s/storage/pvcs.yaml
+echo "[3] Applying RBAC..."
+kubectl apply -f rbac.yaml
+echo "  RBAC resources created."
 
-echo "  Waiting for PVCs to be bound..."
-kubectl wait --for=condition=Bound pvc/n8n-postgres-pvc -n ${NAMESPACE} --timeout=60s
-kubectl wait --for=condition=Bound pvc/n8n-redis-pvc -n ${NAMESPACE} --timeout=60s
-kubectl wait --for=condition=Bound pvc/n8n-data-pvc -n ${NAMESPACE} --timeout=60s
-echo "  All PVCs bound."
-
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Step 4: Storage
+# ---------------------------------------------------------------------------
 echo ""
-echo "[4/8] Deploying PostgreSQL..."
-kubectl apply -f k8s/postgres/postgres.yaml
+echo "[4] Applying storage (StorageClass, PVs, PVCs)..."
+kubectl apply -f storage.yaml
+echo "  Storage resources created."
+
+# Verify PVCs are bound
+echo "  Waiting for PVCs to bind..."
+for pvc in n8n-data-pvc n8n-postgres-pvc n8n-redis-pvc; do
+  echo -n "    ${pvc}: "
+  for i in $(seq 1 30); do
+    STATUS=$(kubectl get pvc "${pvc}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+    if [[ "$STATUS" == "Bound" ]]; then
+      echo "Bound ✓"
+      break
+    fi
+    if [[ "$i" == "30" ]]; then
+      echo "WARNING: still not bound after 60s (status: ${STATUS})"
+      echo "  Check: kubectl describe pvc ${pvc} -n ${NAMESPACE}"
+    fi
+    sleep 2
+  done
+done
+
+# ---------------------------------------------------------------------------
+# Step 5: PostgreSQL
+# ---------------------------------------------------------------------------
+echo ""
+echo "[5] Deploying PostgreSQL..."
+kubectl apply -f postgres.yaml
 
 echo "  Waiting for PostgreSQL to be ready..."
-kubectl wait --for=condition=ready pod/n8n-postgres-0 -n ${NAMESPACE} --timeout=120s
-echo "  PostgreSQL ready."
+kubectl rollout status deployment/n8n-postgres -n "${NAMESPACE}" --timeout=120s
+echo "  PostgreSQL ready ✓"
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Step 6: Redis
+# ---------------------------------------------------------------------------
 echo ""
-echo "[5/8] Applying database schema..."
-kubectl exec -n ${NAMESPACE} n8n-postgres-0 -- psql -U n8n -d n8n -f /dev/stdin < k8s/postgres/schema.sql
-echo "  Schema applied."
-
-# ------------------------------------------------------------
-echo ""
-echo "[6/8] Deploying Redis..."
-kubectl apply -f k8s/redis/redis.yaml
+echo "[6] Deploying Redis..."
+kubectl apply -f redis.yaml
 
 echo "  Waiting for Redis to be ready..."
-kubectl wait --for=condition=ready pod/n8n-redis-0 -n ${NAMESPACE} --timeout=120s
-echo "  Redis ready."
+kubectl rollout status deployment/n8n-redis -n "${NAMESPACE}" --timeout=60s
+echo "  Redis ready ✓"
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Step 7: n8n main
+# ---------------------------------------------------------------------------
 echo ""
-echo "[7/8] Deploying n8n (main + workers)..."
-kubectl apply -f k8s/n8n/configmap.yaml
-kubectl apply -f k8s/n8n/n8n-main.yaml
-kubectl apply -f k8s/n8n/n8n-worker.yaml
+echo "[7] Deploying n8n main..."
+kubectl apply -f n8n-main.yaml
 
 echo "  Waiting for n8n main to be ready..."
-kubectl rollout status deployment/n8n -n ${NAMESPACE} --timeout=180s
+kubectl rollout status deployment/n8n-main -n "${NAMESPACE}" --timeout=180s
+echo "  n8n main ready ✓"
+
+# ---------------------------------------------------------------------------
+# Step 8: n8n workers
+# ---------------------------------------------------------------------------
+echo ""
+echo "[8] Deploying n8n workers..."
+kubectl apply -f n8n-worker.yaml
 
 echo "  Waiting for n8n workers to be ready..."
-kubectl rollout status deployment/n8n-worker -n ${NAMESPACE} --timeout=120s
+kubectl rollout status deployment/n8n-worker -n "${NAMESPACE}" --timeout=120s
+echo "  n8n workers ready ✓"
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Step 9: Ingress
+# ---------------------------------------------------------------------------
 echo ""
-echo "[8/8] Creating Ingress..."
-kubectl apply -f k8s/ingress/ingress.yaml
+echo "[9] Applying Ingress and NetworkPolicy..."
+kubectl apply -f ingress.yaml
+echo "  Ingress applied."
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
 echo ""
-echo "============================================================"
-echo " Deployment Complete!"
-echo "============================================================"
+echo "========================================="
+echo "  Deployment Complete!"
+echo "========================================="
 echo ""
-echo " Resources:"
-kubectl get all -n ${NAMESPACE}
+kubectl get all -n "${NAMESPACE}"
 echo ""
-echo " PVCs:"
-kubectl get pvc -n ${NAMESPACE}
-echo ""
-echo " Next steps:"
-echo "  1. Point DNS: ${DOMAIN} → your ingress load balancer IP"
-echo "  2. Import workflows from workflows/ directory into n8n UI"
-echo "  3. Configure n8n credentials:"
-echo "     - PostgreSQL connection (uses Vault-injected password)"
-echo "     - OpenAI API (uses LLM_API_KEY from Vault)"
-echo "     - Gmail SMTP (uses SMTP credentials from Vault)"
-echo "  4. Activate both workflows in n8n UI"
-echo "  5. Test with: curl -X POST https://${DOMAIN}/webhook/article-topic \\"
+echo "Next steps:"
+echo "  1. Import workflows from workflows/ into n8n UI"
+echo "  2. Create PostgreSQL credential in n8n (n8n PostgreSQL)"
+echo "  3. Create SMTP credential in n8n"
+echo "  4. Create OpenAI/LLM HTTP Header Auth credential in n8n"
+echo "  5. Test: curl -X POST https://n8n.yourdomain.com/webhook/submit-topic \\"
 echo "       -H 'Content-Type: application/json' \\"
-echo "       -d '{\"topic\":\"My First Article Topic\",\"priority\":1}'"
+echo "       -d '{\"topic\": \"Write about ROSA HCP vs Classic\"}'"
 echo ""
+echo "  Monitor pods: kubectl get pods -n ${NAMESPACE} -w"
+echo "  Logs:         kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=n8n -f"

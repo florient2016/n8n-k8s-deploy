@@ -1,6 +1,6 @@
-# n8n on Kubernetes with HashiCorp Vault — Production-Grade Article Automation
+# n8n on Kubernetes with HashiCorp Vault — Production Deployment
 
-> Self-hosted n8n in Kubernetes with Vault-managed secrets, PostgreSQL, Redis queue mode, automated article generation, and email delivery.
+> **Self-hosted n8n article automation system**: submit a topic → scheduled run 3×/week → LLM generates article → email delivered → optional Dev.to publishing.
 
 ---
 
@@ -10,109 +10,94 @@
 2. [Prerequisites](#prerequisites)
 3. [Repository Structure](#repository-structure)
 4. [Vault Configuration](#vault-configuration)
-5. [Kubernetes Manifests](#kubernetes-manifests)
-6. [Storage Configuration](#storage-configuration)
-7. [n8n Workflow Design](#n8n-workflow-design)
-8. [Cron Schedule](#cron-schedule)
-9. [Email Configuration](#email-configuration)
-10. [Medium Publishing](#medium-publishing)
-11. [Deployment Guide](#deployment-guide)
-12. [Topic Queue Schema](#topic-queue-schema)
-13. [Operational Best Practices](#operational-best-practices)
-14. [Security Recommendations](#security-recommendations)
-15. [Troubleshooting](#troubleshooting)
-16. [Alternatives to PostgreSQL Topic Queue](#alternatives)
+5. [Kubernetes Manifests Explained](#kubernetes-manifests-explained)
+6. [Storage Setup](#storage-setup)
+7. [Topic Queue: Database Schema](#topic-queue-database-schema)
+8. [n8n Workflow Design](#n8n-workflow-design)
+9. [Credentials Setup in n8n](#credentials-setup-in-n8n)
+10. [Ingress and HTTPS](#ingress-and-https)
+11. [Schedule: 3×/week Cron](#schedule-3week-cron)
+12. [Email Delivery](#email-delivery)
+13. [Optional Dev.to Publishing](#optional-devto-publishing)
+14. [Deployment Steps](#deployment-steps)
+15. [Submitting Topics](#submitting-topics)
+16. [Environment Variables Reference](#environment-variables-reference)
+17. [Operational Best Practices](#operational-best-practices)
+18. [Security Recommendations](#security-recommendations)
+19. [Troubleshooting](#troubleshooting)
+20. [Alternative Topic Storage Options](#alternative-topic-storage-options)
 
 ---
 
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                         Kubernetes Cluster                                │
-│                                                                           │
-│  ┌─────────────┐     ┌──────────────────────────────────────────────┐   │
-│  │   HashiCorp  │     │              Namespace: n8n                   │   │
-│  │    Vault     │◄────┤                                              │   │
-│  │  (ns: vault) │     │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │   │
-│  └─────────────┘     │  │ n8n-main │  │  Worker  │  │  Worker  │  │   │
-│        ▲             │  │(1 replica)│  │  Pod x1  │  │  Pod x2  │  │   │
-│        │ KV secrets  │  └────┬─────┘  └────┬─────┘  └────┬─────┘  │   │
-│  Vault Agent         │       │              │              │         │   │
-│  Sidecar (injected)  │       └──────────────┴──────────────┘         │   │
-│                      │                    │                           │   │
-│                      │              ┌─────▼──────┐                   │   │
-│                      │              │   Redis    │ ← Bull Queue       │   │
-│                      │              │  (Queue)   │                   │   │
-│                      │              └─────┬──────┘                   │   │
-│                      │                    │                           │   │
-│                      │              ┌─────▼──────┐                   │   │
-│                      │              │ PostgreSQL  │ ← n8n DB +        │   │
-│                      │              │            │   article_topics   │   │
-│                      │              └────────────┘                   │   │
-│                      └──────────────────────────────────────────────┘   │
-│                                                                           │
-│  ┌─────────────┐     ┌──────────────┐                                   │
-│  │   Ingress   │────►│  n8n Service │   HTTPS via cert-manager           │
-│  │  (NGINX)    │     │  ClusterIP   │                                   │
-│  └─────────────┘     └──────────────┘                                   │
-│                                                                           │
-│  Storage (local volumes at /n8n):                                        │
-│  ├── n8n-data-pvc     → /n8n/data                                        │
-│  ├── n8n-postgres-pvc → /n8n/postgres                                    │
-│  └── n8n-redis-pvc    → /n8n/redis                                       │
-└──────────────────────────────────────────────────────────────────────────┘
-
-Automation Flow:
-  You → POST /webhook/submit-topic → PostgreSQL (article_topics)
-                                          │
-                    ┌─────────────────────┘
-                    │  Mon/Wed/Fri 08:00 UTC
-                    ▼
-          Fetch pending topic
-                    │
-                    ▼
-          Generate article (GPT-4o)
-                    │
-                    ▼
-          Send to email ──────────────────────────► Your Inbox
-                    │
-                    ▼ (if MEDIUM_TOKEN set)
-          Post draft to Medium
-                    │
-                    ▼
-          Mark topic as 'done'
+                          ┌─────────────────────────────────────────────┐
+                          │           Kubernetes Cluster                 │
+                          │                                              │
+  You ──── HTTPS ────────►│  Ingress (nginx + cert-manager)             │
+  (submit topic)          │       │                                      │
+                          │       ▼                                      │
+                          │  ┌──────────┐    ┌─────────────────────┐    │
+                          │  │  n8n     │◄──►│  HashiCorp Vault     │    │
+                          │  │  Main    │    │  (secrets injected   │    │
+                          │  │  (UI +   │    │   via Agent sidecar) │    │
+                          │  │ Webhooks)│    └─────────────────────┘    │
+                          │  └────┬─────┘                               │
+                          │       │ Queue (Bull/Redis)                   │
+                          │       ▼                                      │
+                          │  ┌──────────┐   ┌──────────┐               │
+                          │  │  n8n     │   │  n8n     │  (2+ workers) │
+                          │  │ Worker 1 │   │ Worker 2 │               │
+                          │  └────┬─────┘   └────┬─────┘               │
+                          │       │               │                      │
+                          │       └───────┬───────┘                     │
+                          │               ▼                              │
+                          │  ┌──────────────────────────────────────┐   │
+                          │  │  PostgreSQL          Redis            │   │
+                          │  │  (n8n state +        (Bull queue)    │   │
+                          │  │   topic queue)                        │   │
+                          │  └──────────────────────────────────────┘   │
+                          └─────────────────────────────────────────────┘
+                                       │
+                          Scheduled Workflow (Mon/Wed/Fri 9am)
+                                       │
+                               ┌───────▼────────┐
+                               │  LLM API       │
+                               │  (OpenAI GPT-4)│
+                               └───────┬────────┘
+                                       │
+                          ┌────────────▼─────────────┐
+                          │  Email (SMTP/Gmail)       │
+                          │  Optional: Dev.to API     │
+                          └──────────────────────────┘
 ```
 
 **Components:**
 
-| Component | Role | Replicas |
-|-----------|------|----------|
-| n8n main | UI, scheduler, webhook receiver | 1 |
-| n8n worker | Execution engine (queue consumer) | 2 (HPA: 2–10) |
-| PostgreSQL 16 | n8n metadata + article topic queue | 1 |
-| Redis 7 | Bull queue for job distribution | 1 |
-| Vault Agent | Secret injection sidecar | per pod |
+| Component | Purpose | Image |
+|-----------|---------|-------|
+| n8n Main | Workflow engine, UI, webhooks | `n8nio/n8n:latest` |
+| n8n Workers | Execute workflow jobs from queue | `n8nio/n8n:latest` |
+| PostgreSQL 15 | n8n state + article topic queue | `postgres:15-alpine` |
+| Redis 7 | Bull queue for worker jobs | `redis:7-alpine` |
+| HashiCorp Vault | Secret management (existing install) | — |
+| Nginx Ingress | HTTPS termination | — |
+| cert-manager | Automatic TLS certificates | — |
 
 ---
 
 ## Prerequisites
 
-- Kubernetes cluster (v1.25+)
-- `kubectl` configured
-- HashiCorp Vault installed in namespace `vault` (pod: `vault-0`)
-- Vault Agent Injector webhook installed (`vault-agent-injector`)
-- NGINX Ingress Controller
-- cert-manager (for TLS) — *or* pre-existing wildcard certificate
-- Node with `/n8n` directory writable (for local PVs)
-- OpenAI API key (or Anthropic/other LLM)
-- Gmail account with App Password (or other SMTP)
-
-**Verify Vault Agent Injector is installed:**
-```bash
-kubectl get pods -n vault
-# Should show: vault-agent-injector-xxx   Running
-```
+- Kubernetes cluster with:
+  - Vault already installed in `vault` namespace
+  - `vault-0` pod running
+  - Vault Agent Injector (webhook) deployed (standard with Vault Helm chart)
+  - nginx ingress controller
+  - cert-manager with a `letsencrypt-prod` ClusterIssuer
+  - `metrics-server` (for HPA)
+- `kubectl` configured with cluster admin access
+- Environment variables set (see below)
 
 ---
 
@@ -121,34 +106,31 @@ kubectl get pods -n vault
 ```
 n8n-k8s/
 ├── vault/
-│   ├── 01-vault-setup.sh          # One-time Vault config script
-│   └── n8n-vault-policy.hcl       # Vault policy (read-only for n8n paths)
+│   ├── 01-vault-setup.sh          # One-time Vault configuration script
+│   └── n8n-policy.hcl             # Vault policy for n8n secrets
 ├── k8s/
-│   ├── namespace/
-│   │   └── namespace.yaml         # Namespace: n8n
-│   ├── storage/
-│   │   └── storage.yaml           # StorageClass + PVs + PVCs
+│   ├── base/
+│   │   └── namespace.yaml         # n8n namespace
 │   ├── rbac/
-│   │   └── rbac.yaml              # ServiceAccount n8n-sa + RBAC
+│   │   └── rbac.yaml              # ServiceAccount, ClusterRoleBinding, Role
+│   ├── storage/
+│   │   └── storage.yaml           # StorageClass, PVs, PVCs
 │   ├── postgres/
-│   │   └── postgres.yaml          # PostgreSQL deployment + init SQL
+│   │   └── postgres.yaml          # PostgreSQL Deployment + Service + ConfigMap
 │   ├── redis/
-│   │   └── redis.yaml             # Redis deployment
+│   │   └── redis.yaml             # Redis Deployment + Service + ConfigMap
 │   ├── n8n/
-│   │   ├── configmap.yaml         # Non-sensitive n8n config
-│   │   ├── n8n-main.yaml          # n8n main instance
-│   │   └── n8n-worker.yaml        # n8n workers + HPA
-│   ├── ingress/
-│   │   └── ingress.yaml           # Ingress + TLS + cert-manager
-│   └── vault-agent/
-│       └── vault-agent-configmap.yaml  # Reference Vault Agent config
+│   │   ├── n8n-main.yaml          # n8n main Deployment + Service + ConfigMap
+│   │   └── n8n-worker.yaml        # n8n Worker Deployment + HPA
+│   └── ingress/
+│       └── ingress.yaml           # Ingress + NetworkPolicy
 ├── workflows/
-│   ├── 01-topic-input-workflow.json        # Webhook to accept topics
-│   ├── 02-scheduled-publishing-workflow.json  # Main automation
-│   └── 03-error-handler-workflow.json      # Error notifications
+│   ├── 01-topic-input-workflow.json       # Webhook to receive topics
+│   ├── 02-scheduled-publisher-workflow.json  # Scheduled article generator
+│   └── 03-error-handler-workflow.json     # Error alerting
 ├── scripts/
-│   ├── deploy.sh                  # Full deployment script
-│   └── troubleshoot.sh            # Diagnostic script
+│   ├── deploy.sh                  # Master deploy script
+│   └── create-host-dirs.sh        # Node-level directory setup
 └── README.md
 ```
 
@@ -156,159 +138,176 @@ n8n-k8s/
 
 ## Vault Configuration
 
-### Secret Paths
+### Required Environment Variables
 
-| Path | Keys | Description |
-|------|------|-------------|
-| `secret/n8n/core` | `encryption_key` | n8n data encryption key (32+ chars) |
-| `secret/n8n/postgres` | `password`, `user`, `db`, `host`, `port` | PostgreSQL credentials |
-| `secret/n8n/redis` | `password`, `host`, `port` | Redis credentials |
-| `secret/n8n/smtp` | `password` | Gmail App Password or SMTP password |
-| `secret/n8n/llm` | `api_key` | OpenAI/Anthropic/LLM API key |
-| `secret/n8n/medium` | `token` | Medium integration token (optional) |
-
-### Step 1: Run Vault Setup Script
-
+```bash
 export VAULT_ROOT_TOKEN="hvs.xxxxxxxxxxxx"
 export N8N_ENCRYPTION_KEY="$(openssl rand -base64 32)"
 export POSTGRES_PASSWORD="$(openssl rand -base64 24)"
 export REDIS_PASSWORD="$(openssl rand -base64 24)"
 export SMTP_PASSWORD="your-gmail-app-password"
 export LLM_API_KEY="sk-proj-xxxxxxxxxxxx"
-export MEDIUM_TOKEN="your-medium-token"   # omit entirely to skip
+export DEV_TOKEN="your-dev-token"   # Optional — omit to skip Dev.to
+```
+
+### Run Vault Setup
 
 ```bash
 chmod +x vault/01-vault-setup.sh
 ./vault/01-vault-setup.sh
 ```
 
-This script:
-1. Collects your Kubernetes API host and CA certificate
-2. Gets the Vault SA JWT from the `vault-0` pod
-3. Prompts for all secret values (input is hidden)
-4. Enables KV-v2 at `secret/`
-5. Writes all secrets to Vault
-6. Creates the `n8n-policy` Vault policy
-7. Enables and configures Kubernetes auth method
-8. Creates the `n8n` Kubernetes auth role
+This script (executed via `kubectl exec` on `vault-0`):
 
-### Step 2: Verify Secrets Were Written
+1. Enables KV v2 secrets engine at `secret/`
+2. Creates the `n8n` Vault policy
+3. Writes secrets to these paths:
+   - `secret/n8n/core` → `encryption_key`
+   - `secret/n8n/postgres` → `password`, `host`, `port`, `database`, `user`
+   - `secret/n8n/redis` → `password`, `host`, `port`
+   - `secret/n8n/smtp` → `password`
+   - `secret/n8n/llm` → `api_key`
+   - `secret/n8n/devto` → `token` (optional)
+4. Enables Kubernetes auth backend
+5. Configures Kubernetes auth with cluster CA and API host
+6. Creates `n8n` Vault role bound to `n8n-sa` service account
 
-```bash
-# All commands use kubectl exec on vault-0 (as required)
+### Vault Secret Paths
 
-# List secrets
-kubectl exec -n vault vault-0 -- vault kv list secret/n8n/
-
-# Read a specific secret (redacted)
-kubectl exec -n vault vault-0 -- vault kv get secret/n8n/postgres
-
-# Verify the policy
-kubectl exec -n vault vault-0 -- vault policy read n8n-policy
-
-# Verify Kubernetes auth role
-kubectl exec -n vault vault-0 -- vault read auth/kubernetes/role/n8n
 ```
-
-### Vault Policy Details
-
-```hcl
-# Grants READ access to all n8n secret paths
-path "secret/data/n8n/*" {
-  capabilities = ["read", "list"]
-}
-path "secret/metadata/n8n/*" {
-  capabilities = ["list"]
-}
+secret/
+└── n8n/
+    ├── core        { encryption_key }
+    ├── postgres    { password, host, port, database, user }
+    ├── redis       { password, host, port }
+    ├── smtp        { password }
+    ├── llm         { api_key }
+    └── devto       { token }
 ```
 
 ### How Vault Agent Injection Works
 
-Every n8n pod has these Kubernetes annotations:
+Each pod has these annotations:
 
 ```yaml
-annotations:
-  vault.hashicorp.com/agent-inject: "true"
-  vault.hashicorp.com/role: "n8n"
-  vault.hashicorp.com/agent-inject-secret-postgres: "secret/data/n8n/postgres"
-  vault.hashicorp.com/agent-inject-template-postgres: |
-    {{- with secret "secret/data/n8n/postgres" -}}
-    export DB_POSTGRESDB_PASSWORD="{{ .Data.data.password }}"
-    {{- end }}
+vault.hashicorp.com/agent-inject: "true"
+vault.hashicorp.com/role: "n8n"
+vault.hashicorp.com/agent-inject-secret-<name>: "secret/data/n8n/<path>"
+vault.hashicorp.com/agent-inject-template-<name>: |
+  {{- with secret "secret/data/n8n/<path>" -}}
+  export SOME_VAR="{{ .Data.data.field }}"
+  {{- end }}
 ```
 
-The Vault Agent Injector mutating webhook:
-1. Intercepts the pod creation
-2. Injects a `vault-agent` init container that authenticates to Vault using the pod's SA token
-3. Renders the Consul Template (`.ctmpl`) into `/vault/secrets/<name>`
-4. The n8n container sources these files at startup: `. /vault/secrets/postgres`
+The Vault Agent sidecar:
+- Authenticates with Vault using the pod's Kubernetes service account token
+- Renders secret templates to `/vault/secrets/<filename>`
+- n8n starts with: `source /vault/secrets/n8n-*-env && exec n8n start`
 
-Secrets are stored in an `emptyDir` volume with `medium: Memory` (RAM only — not written to disk).
+Secrets live in a **memory-backed emptyDir** — never written to disk.
 
 ---
 
-## Kubernetes Manifests
+## Kubernetes Manifests Explained
 
-### Applying Manifests
+### ServiceAccount & RBAC (`k8s/rbac/rbac.yaml`)
 
-```bash
-# In order:
-kubectl apply -f k8s/namespace/namespace.yaml
-kubectl apply -f k8s/rbac/rbac.yaml
-kubectl apply -f k8s/storage/storage.yaml    # Edit YOUR_NODE_NAME first!
-kubectl apply -f k8s/postgres/postgres.yaml
-kubectl apply -f k8s/redis/redis.yaml
-kubectl apply -f k8s/n8n/configmap.yaml      # Edit YOUR_DOMAIN.com first!
-kubectl apply -f k8s/n8n/n8n-main.yaml
-kubectl apply -f k8s/n8n/n8n-worker.yaml
-kubectl apply -f k8s/ingress/ingress.yaml    # Edit YOUR_DOMAIN.com first!
-```
+- `n8n-sa` — ServiceAccount used by all n8n pods
+- `n8n-vault-token-review` — ClusterRoleBinding granting `system:auth-delegator` so Vault can verify service account tokens
+- `n8n-secret-reader` — Role + RoleBinding for reading secrets in the `n8n` namespace
 
-Or use the deploy script:
-```bash
-./scripts/deploy.sh my-node-name
-```
+### Storage (`k8s/storage/storage.yaml`)
 
-### Required Substitutions Before Applying
+| Resource | Type | Size | Mount Path |
+|----------|------|------|-----------|
+| `n8n-data-pvc` | PVC | 5 Gi | `/home/node/.n8n` |
+| `n8n-postgres-pvc` | PVC | 10 Gi | `/var/lib/postgresql/data` |
+| `n8n-redis-pvc` | PVC | 2 Gi | `/data` |
 
-In `k8s/storage/storage.yaml`:
+StorageClass `standard` uses `kubernetes.io/no-provisioner` (local volumes on `/n8n`).
+
+### n8n ConfigMap (`n8n-config`)
+
+**Before applying, update these values in `k8s/n8n/n8n-main.yaml`:**
+
 ```yaml
-- YOUR_NODE_NAME   # ← your actual Kubernetes node hostname
-```
-
-In `k8s/n8n/configmap.yaml`:
-```yaml
-N8N_HOST: "n8n.YOUR_DOMAIN.com"
-WEBHOOK_URL: "https://n8n.YOUR_DOMAIN.com/"
+N8N_HOST: "n8n.yourdomain.com"          # your actual domain
+WEBHOOK_URL: "https://n8n.yourdomain.com"
+GENERIC_TIMEZONE: "Europe/Berlin"        # your timezone (TZ database name)
+TZ: "Europe/Berlin"
+N8N_SMTP_SENDER: "your-email@gmail.com"
 N8N_SMTP_USER: "your-email@gmail.com"
-GENERIC_TIMEZONE: "Europe/Berlin"   # ← your timezone (e.g., America/New_York)
-```
-
-In `k8s/ingress/ingress.yaml`:
-```yaml
-email: your-email@example.com
-host: n8n.YOUR_DOMAIN.com
 ```
 
 ---
 
-## Storage Configuration
+## Storage Setup
 
-All PVCs use the `standard` StorageClass backed by local volumes on `/n8n`:
+### Step 1: Create host directories on each node
 
-| PVC Name | Mount Path on Node | Size | Used By |
-|---|---|---|---|
-| `n8n-data-pvc` | `/n8n/data` | 5Gi | n8n main (workflows, credentials) |
-| `n8n-postgres-pvc` | `/n8n/postgres` | 10Gi | PostgreSQL data |
-| `n8n-redis-pvc` | `/n8n/redis` | 2Gi | Redis AOF persistence |
-
-**Create host directories on your node before applying:**
 ```bash
-# Run on the target Kubernetes node
-sudo mkdir -p /n8n/data /n8n/postgres /n8n/redis
-sudo chown -R 1000:1000 /n8n/data    # n8n user
-sudo chown -R 999:999 /n8n/postgres  # postgres user
-sudo chown -R 1000:1000 /n8n/redis   # redis user
+# SSH to each Kubernetes node that may schedule n8n pods
+chmod +x scripts/create-host-dirs.sh
+./scripts/create-host-dirs.sh
+```
+
+This creates:
+```
+/n8n/
+├── n8n-data/    (owner: uid 1000)
+├── postgres/    (owner: uid 999)
+└── redis/       (owner: uid 999)
+```
+
+### Step 2: Apply storage manifests
+
+```bash
+kubectl apply -f k8s/storage/storage.yaml
+kubectl get pvc -n n8n
+```
+
+---
+
+## Topic Queue: Database Schema
+
+The `article_topics` table is auto-created by the PostgreSQL init script:
+
+```sql
+CREATE TABLE article_topics (
+    id           SERIAL PRIMARY KEY,
+    topic        TEXT        NOT NULL,
+    status       VARCHAR(20) NOT NULL DEFAULT 'pending',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    scheduled_at TIMESTAMPTZ,
+    processed_at TIMESTAMPTZ,
+    article_url  TEXT,
+    error_msg    TEXT,
+    retry_count  INT         NOT NULL DEFAULT 0,
+    CONSTRAINT status_check CHECK (status IN ('pending','processing','done','failed'))
+);
+```
+
+**Status lifecycle:**
+
+```
+pending → processing → done
+                    ↘ failed  (after 3 retries)
+```
+
+**Useful queries:**
+
+```sql
+-- View queue
+SELECT id, LEFT(topic, 60) AS topic, status, created_at, retry_count
+FROM article_topics
+ORDER BY created_at DESC;
+
+-- Re-queue a failed topic
+UPDATE article_topics SET status = 'pending', retry_count = 0, error_msg = NULL
+WHERE id = <id>;
+
+-- View processed articles
+SELECT id, topic, article_url, processed_at FROM article_topics WHERE status = 'done';
 ```
 
 ---
@@ -317,526 +316,476 @@ sudo chown -R 1000:1000 /n8n/redis   # redis user
 
 ### Workflow 1: Topic Input (Webhook)
 
-**Purpose:** Accept article topics via HTTP POST and store them in PostgreSQL.
+**Trigger:** HTTP POST to `https://n8n.yourdomain.com/webhook/submit-topic`
 
 ```
-[Webhook Trigger]
-    POST /webhook/submit-topic
-    Body: { "topic": "Write about ROSA HCP vs Classic" }
-         │
-         ▼
-[IF Node] ── topic provided? ──YES──► [PostgreSQL INSERT]
-                             │                │
-                             NO               ▼
-                             │        [Respond 200 + topic ID]
-                             ▼
-                    [Respond 400 + error]
+Webhook → Validate Input → INSERT INTO article_topics → Success/Error Response
 ```
 
-**Node-by-node:**
+**Node by node:**
 
-| # | Node | Type | Purpose |
-|---|------|------|---------|
-| 1 | Webhook - Receive Topic | Webhook | POST endpoint at `/webhook/submit-topic` |
-| 2 | IF - Topic Provided? | If | Validate `body.topic` is not empty |
-| 3 | PostgreSQL - Insert Topic | Postgres | `INSERT INTO article_topics (topic)` |
-| 4 | Respond - Success | Respond to Webhook | Return `{success: true, id, topic}` |
-| 5 | Respond - Error | Respond to Webhook | Return 400 with error message |
+| Node | Type | Purpose |
+|------|------|---------|
+| Webhook: Receive Topic | Webhook | Accept POST with `{ topic, scheduled_at? }` |
+| Validate Input | IF | Ensure `topic` is not empty |
+| Insert Topic to PostgreSQL | Postgres | INSERT into `article_topics` with `status='pending'` |
+| Success Response | Respond to Webhook | Return `{ success: true, id, topic }` |
+| Error Response | Respond to Webhook | Return `{ success: false, error }` (HTTP 400) |
 
-**Example usage:**
-```bash
-curl -X POST https://n8n.YOUR_DOMAIN.com/webhook/submit-topic \
-  -H 'Content-Type: application/json' \
-  -d '{"topic": "How to deploy n8n on Kubernetes with Vault integration"}'
+### Workflow 2: Scheduled Publisher
 
-# Response:
-# {"success": true, "id": 1, "topic": "How to deploy...", "created_at": "..."}
-```
-
----
-
-### Workflow 2: Scheduled Publishing (Main Automation)
-
-**Purpose:** Every Mon/Wed/Fri at 08:00, fetch the oldest pending topic, generate an article, email it, and optionally post to Medium.
+**Trigger:** Cron `0 9 * * 1,3,5` (Mon/Wed/Fri at 09:00)
 
 ```
-[Schedule Trigger] Mon/Wed/Fri 08:00
-         │
-         ▼
-[PostgreSQL] SELECT oldest pending topic (retry_count < 3)
-         │
-         ▼
-[IF] Topic exists?
-    YES ──► [PostgreSQL] UPDATE status='processing'
-                 │
-                 ▼
-           [OpenAI] Generate article (GPT-4o, ~2000 words)
-                 │
-                 ▼
-           [Code Node] Extract title, tags, word count
-                 │
-                 ▼
-           [Email] Send HTML email with full article
-                 │
-                 ▼
-           [IF] MEDIUM_TOKEN env set?
-              YES ──► [HTTP] GET medium.com/v1/users/me
-                          │
-                          ▼
-                     [HTTP] POST create draft on Medium
-                          │
-                          ▼
-              NO ─────► [PostgreSQL] UPDATE status='done'
-    NO  ──► (silently end — no topics pending)
+Schedule Trigger
+    └→ Fetch Next Pending Topic (SELECT ... FOR UPDATE SKIP LOCKED)
+        └→ Topic Available? (IF)
+            ├→ [YES] Mark as Processing (UPDATE status='processing')
+            │    └→ Generate Article via LLM (HTTP POST to OpenAI)
+            │        └→ Parse & Format Article (Code node)
+            │            └→ Send Article via Email
+            │                └→ Dev.to Token Available? (IF)
+            │                    ├→ [YES] Publish Draft to Dev.to → Mark Done (with URL)
+            │                    └→ [NO]  Mark Done (email only)
+            └→ [NO]  Stop gracefully
 ```
 
-**Node-by-node:**
+**Key design decisions:**
 
-| # | Node | Type | Purpose |
-|---|------|------|---------|
-| 1 | Schedule - 3x Per Week | Schedule Trigger | Cron `0 8 * * 1,3,5` |
-| 2 | PostgreSQL - Fetch Next Topic | Postgres | SELECT oldest pending topic |
-| 3 | IF - Topic Exists? | If | Guard if queue is empty |
-| 4 | PostgreSQL - Mark Processing | Postgres | UPDATE status='processing' |
-| 5 | OpenAI - Generate Article | OpenAI | GPT-4o with detailed system prompt |
-| 6 | Code - Format Article | Code | Parse title, tags, word count |
-| 7 | Email - Send Article | Email (SMTP) | Styled HTML email |
-| 8 | IF - Medium Token Set? | If | Check `MEDIUM_TOKEN` env var |
-| 9 | Medium - Get User ID | HTTP Request | GET `/v1/users/me` |
-| 10 | Medium - Create Draft | HTTP Request | POST create draft |
-| 11 | PostgreSQL - Mark Done | Postgres | UPDATE status='done' |
-
----
+- `FOR UPDATE SKIP LOCKED` prevents duplicate processing when multiple workers are running
+- `status='processing'` is set before the LLM call to prevent race conditions
+- Error handling resets to `pending` with `retry_count++` (max 3 retries)
+- Dev.to publishing checks for `DEV_TOKEN` env var — gracefully skips if not set
 
 ### Workflow 3: Error Handler
 
-Configured as the `errorWorkflow` for Workflow 2. Triggered on any uncaught exception.
+Set as the **Error Workflow** for Workflow 2. Sends an HTML email alert with the error message, stack trace, and execution ID.
 
-```
-[Error Trigger]
-     │
-     ▼
-[PostgreSQL] Revert any stuck 'processing' topics to 'error'
-     │
-     ▼
-[Email] Send error alert with: workflow name, node, error message, execution link
+---
+
+## Credentials Setup in n8n
+
+After deployment, create these credentials in the n8n UI (`Settings → Credentials`):
+
+### PostgreSQL Credential
+- **Type:** PostgreSQL
+- **Name:** `n8n PostgreSQL`
+- Host: `n8n-postgres-svc.n8n.svc.cluster.local`
+- Port: `5432`
+- Database: `n8n`
+- User: `n8n`
+- Password: *(from Vault — set manually or use env-sourced value)*
+
+### SMTP Credential
+- **Type:** SMTP
+- **Name:** `n8n SMTP`
+- Host: `smtp.gmail.com`
+- Port: `587`
+- User: `your-email@gmail.com`
+- Password: *(Gmail App Password from Vault)*
+
+### LLM Credential (OpenAI)
+- **Type:** HTTP Header Auth
+- **Name:** `OpenAI LLM`
+- Header Name: `Authorization`
+- Header Value: `Bearer sk-proj-xxxxxxxx`
+
+> For Claude/Anthropic, create a second HTTP Header Auth credential with `x-api-key: sk-ant-...`
+
+---
+
+## Ingress and HTTPS
+
+The Ingress uses cert-manager with Let's Encrypt. Before applying:
+
+1. Update `n8n.yourdomain.com` in `k8s/ingress/ingress.yaml`
+2. Ensure your `ClusterIssuer` name matches (`letsencrypt-prod`)
+3. Create DNS A/CNAME record pointing to your ingress controller's external IP
+
+```bash
+kubectl get svc -n ingress-nginx   # find EXTERNAL-IP
 ```
 
 ---
 
-## Cron Schedule
+## Schedule: 3×/week Cron
 
-The scheduler runs **Monday, Wednesday, Friday at 08:00** (timezone from `GENERIC_TIMEZONE`):
+The Schedule Trigger node uses:
 
 ```
-0 8 * * 1,3,5
-│ │ │ │  └─── Days of week: 1=Mon, 3=Wed, 5=Fri
-│ │ │ └────── Month: * (every month)
-│ │ └──────── Day of month: * (any)
-│ └────────── Hour: 8 (08:00)
-└──────────── Minute: 0
+0 9 * * 1,3,5
 ```
 
-**To change the schedule**, edit the `Schedule - 3x Per Week` node in Workflow 02:
+**Breakdown:**
+- `0` — at minute 0
+- `9` — at hour 9 (09:00)
+- `*` — every day of month
+- `*` — every month
+- `1,3,5` — Monday (1), Wednesday (3), Friday (5)
 
-| Use Case | Cron Expression |
-|---|---|
-| Mon/Wed/Fri 08:00 (default) | `0 8 * * 1,3,5` |
-| Tue/Thu/Sat 09:00 | `0 9 * * 2,4,6` |
-| Weekdays 06:00 | `0 6 * * 1-5` |
-| Every day 07:30 | `30 7 * * *` |
-| Mon/Wed 10:00 | `0 10 * * 1,3` |
+**Respects `GENERIC_TIMEZONE`** set in the ConfigMap.
+
+To change frequency:
+
+| Schedule | Cron Expression |
+|---------|----------------|
+| Mon/Wed/Fri 9am | `0 9 * * 1,3,5` |
+| Tue/Thu/Sat 10am | `0 10 * * 2,4,6` |
+| Daily 8am | `0 8 * * *` |
+| Weekdays 9am | `0 9 * * 1-5` |
 
 ---
 
-## Email Configuration
+## Email Delivery
 
-**Gmail App Password setup** (recommended):
-
-1. Go to [myaccount.google.com](https://myaccount.google.com)
-2. Security → 2-Step Verification → App passwords
-3. Create a new app password for "Mail"
-4. Store it in Vault: run `vault/01-vault-setup.sh` and enter it when prompted
-
-**ConfigMap settings** (edit `k8s/n8n/configmap.yaml`):
+n8n uses its built-in SMTP integration. Configuration is in the `n8n-config` ConfigMap:
 
 ```yaml
 N8N_EMAIL_MODE: "smtp"
 N8N_SMTP_HOST: "smtp.gmail.com"
 N8N_SMTP_PORT: "587"
-N8N_SMTP_USER: "your-email@gmail.com"
-N8N_SMTP_SENDER: "n8n Automation <your-email@gmail.com>"
-N8N_SMTP_SSL: "false"
 N8N_SMTP_STARTTLS: "true"
-# N8N_SMTP_PASS → injected from Vault secret/n8n/smtp
+N8N_SMTP_USER: "your-email@gmail.com"
 ```
 
-**Other SMTP providers:**
+**Gmail setup:**
+1. Enable 2FA on your Google account
+2. Go to: Google Account → Security → App Passwords
+3. Create an App Password for "Mail"
+4. Use the 16-character app password as `SMTP_PASSWORD`
 
-| Provider | Host | Port | TLS |
-|---|---|---|---|
-| Gmail | smtp.gmail.com | 587 | STARTTLS |
-| SendGrid | smtp.sendgrid.net | 587 | STARTTLS |
-| Mailgun | smtp.mailgun.org | 587 | STARTTLS |
-| AWS SES | email-smtp.us-east-1.amazonaws.com | 587 | STARTTLS |
-| Outlook | smtp.office365.com | 587 | STARTTLS |
+**For other providers:**
+
+| Provider | Host | Port |
+|----------|------|------|
+| Gmail | smtp.gmail.com | 587 |
+| Outlook | smtp.office365.com | 587 |
+| SendGrid | smtp.sendgrid.net | 587 |
+| Mailgun | smtp.mailgun.org | 587 |
 
 ---
 
-## Medium Publishing
+## Optional Dev.to Publishing
 
-Medium publishing is **optional** and gated by the `MEDIUM_TOKEN` environment variable.
+If `DEV_TOKEN` is set in Vault at `secret/n8n/devto`, the workflow automatically creates a **draft article** on Dev.to after email delivery.
 
-### Enabling Medium Integration
+**To get a Dev.to API token:**
+1. Go to https://dev.to/settings/extensions
+2. Generate a new API key
+3. Add it to your env: `export DEV_TOKEN="your-token-here"`
+4. Re-run `vault/01-vault-setup.sh` or manually:
+   ```bash
+   kubectl exec -n vault vault-0 -- env VAULT_TOKEN=$VAULT_ROOT_TOKEN \
+     vault kv put secret/n8n/devto token="your-token"
+   ```
 
-1. Get your Medium Integration Token:
-   - Go to [medium.com/me/settings](https://medium.com/me/settings)
-   - Integration tokens → Get integration token
-
-2. Store in Vault:
-```bash
-kubectl exec -n vault vault-0 -- \
-  vault kv patch secret/n8n/medium token="YOUR_MEDIUM_TOKEN"
-```
-
-3. The workflow automatically checks the token at runtime:
-   - If set and not `DISABLED` → creates a **draft** on Medium
-   - If not set → email only
-
-### Medium API Notes
-
-- Articles are created as **drafts** (`publishStatus: draft`) — you review before publishing
-- Change to `"public"` in the HTTP Request node to auto-publish
-- The Medium API supports `markdown` content format (used here)
-- Rate limits: 10 posts per hour per user
+**To auto-publish (not draft):** In Workflow 2, change `"published": false` to `"published": true` in the Dev.to HTTP Request node.
 
 ---
 
-## Deployment Guide
-
-### Quick Start
+## Deployment Steps
 
 ```bash
-# 1. Clone / copy this repository
+# 1. Clone / prepare the repo
 cd n8n-k8s
 
-# 2. Edit configurations
-# ── Replace YOUR_NODE_NAME in k8s/storage/storage.yaml
-# ── Replace YOUR_DOMAIN.com in k8s/n8n/configmap.yaml and k8s/ingress/ingress.yaml
-# ── Replace your-email@gmail.com in k8s/n8n/configmap.yaml
+# 2. Set required environment variables
+export VAULT_ROOT_TOKEN="hvs.xxxxxxxxxxxx"
+export N8N_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+export POSTGRES_PASSWORD="$(openssl rand -base64 24)"
+export REDIS_PASSWORD="$(openssl rand -base64 24)"
+export SMTP_PASSWORD="your-gmail-app-password"
+export LLM_API_KEY="sk-proj-xxxxxxxxxxxx"
+export DEV_TOKEN="your-dev-token"      # Optional
 
-# 3. Configure Vault
+# 3. Update domain/email in manifests
+sed -i 's/n8n.yourdomain.com/n8n.mycompany.com/g' \
+  k8s/n8n/n8n-main.yaml \
+  k8s/ingress/ingress.yaml \
+  workflows/02-scheduled-publisher-workflow.json \
+  workflows/03-error-handler-workflow.json
+
+sed -i 's/your-email@gmail.com/me@mycompany.com/g' \
+  k8s/n8n/n8n-main.yaml \
+  workflows/02-scheduled-publisher-workflow.json \
+  workflows/03-error-handler-workflow.json
+
+# 4. Configure Vault
 chmod +x vault/01-vault-setup.sh
 ./vault/01-vault-setup.sh
 
-# 4. Create host directories on your node
-ssh <node> "sudo mkdir -p /n8n/{data,postgres,redis} && sudo chmod -R 777 /n8n"
+# 5. Create host directories (on each node)
+# SSH into node and run: ./scripts/create-host-dirs.sh
 
-# 5. Deploy
+# 6. Deploy
 chmod +x scripts/deploy.sh
-./scripts/deploy.sh <your-node-name>
-```
+./scripts/deploy.sh
 
-### Post-Deployment: Configure n8n Credentials
+# 7. Import workflows in n8n UI
+#    Settings → Workflows → Import from File
+#    Import: workflows/01-topic-input-workflow.json
+#    Import: workflows/02-scheduled-publisher-workflow.json
+#    Import: workflows/03-error-handler-workflow.json
 
-In the n8n UI (`https://n8n.YOUR_DOMAIN.com`):
+# 8. Configure credentials in n8n UI (see Credentials section)
 
-1. **PostgreSQL credential** (name: `n8n PostgreSQL`):
-   - Host: `postgres-service.n8n.svc.cluster.local`
-   - Database: `n8n`
-   - User: `n8n`
-   - Password: *(from Vault secret/n8n/postgres)*
-
-2. **OpenAI credential** (name: `OpenAI API`):
-   - API Key: *(from Vault secret/n8n/llm)*
-
-3. **SMTP credential** (name: `SMTP Gmail`):
-   - Host: `smtp.gmail.com`, Port: `587`
-   - User: `your-email@gmail.com`
-   - Password: *(from Vault secret/n8n/smtp)*
-
-### Import Workflows
-
-```
-n8n UI → Workflows → Import from file
-```
-Import in order:
-1. `workflows/03-error-handler-workflow.json`
-2. `workflows/01-topic-input-workflow.json`
-3. `workflows/02-scheduled-publishing-workflow.json`
-
-Activate all three workflows (toggle the switch to ON).
-
-### Submit Your First Topic
-
-```bash
-curl -X POST https://n8n.YOUR_DOMAIN.com/webhook/submit-topic \
-  -H 'Content-Type: application/json' \
-  -d '{"topic": "How to deploy n8n on Kubernetes with Vault integration"}'
+# 9. Activate workflows (toggle in n8n UI)
 ```
 
 ---
 
-## Topic Queue Schema
+## Submitting Topics
 
-```sql
-CREATE TABLE article_topics (
-    id            SERIAL PRIMARY KEY,
-    topic         TEXT        NOT NULL,
-    status        VARCHAR(20) NOT NULL DEFAULT 'pending',
-    -- 'pending'    → waiting to be processed
-    -- 'processing' → currently being generated
-    -- 'done'       → article generated and emailed
-    -- 'error'      → failed (see error_message)
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    scheduled_at  TIMESTAMPTZ,          -- when processing started
-    processed_at  TIMESTAMPTZ,          -- when completed/failed
-    article_title TEXT,                 -- extracted article title
-    article_url   TEXT,                 -- Medium URL if published
-    error_message TEXT,                 -- error details if status=error
-    retry_count   INTEGER NOT NULL DEFAULT 0  -- max 3 retries
-);
-```
+Via curl:
 
-**Useful queries:**
-
-```sql
--- See queue status
-SELECT status, count(*) FROM article_topics GROUP BY status;
-
--- See pending topics in order
-SELECT id, topic, created_at FROM article_topics WHERE status='pending' ORDER BY created_at;
-
--- Reset a failed topic for retry
-UPDATE article_topics SET status='pending', retry_count=0, error_message=NULL WHERE id=<id>;
-
--- View recent completions
-SELECT id, topic, article_title, processed_at FROM article_topics
-WHERE status='done' ORDER BY processed_at DESC LIMIT 10;
-```
-
-**Connect to PostgreSQL:**
 ```bash
-kubectl exec -n n8n deploy/postgres -- psql -U n8n -d n8n
+# Submit a topic for the next scheduled run
+curl -X POST https://n8n.yourdomain.com/webhook/submit-topic \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "Write about ROSA HCP vs Classic: comparing managed OpenShift options"}'
+
+# Submit with a specific scheduled time
+curl -X POST https://n8n.yourdomain.com/webhook/submit-topic \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topic": "Terraform best practices on AKS",
+    "scheduled_at": "2025-01-20T09:00:00Z"
+  }'
+
+# View queue status (direct DB query via kubectl)
+kubectl exec -n n8n \
+  $(kubectl get pod -n n8n -l app=n8n-postgres -o jsonpath='{.items[0].metadata.name}') \
+  -- psql -U n8n -d n8n \
+  -c "SELECT id, LEFT(topic,60), status, created_at FROM article_topics ORDER BY created_at DESC;"
 ```
+
+**Topic examples:**
+- `"Write about ROSA HCP vs Classic"`
+- `"Terraform best practices on AKS"`
+- `"How to deploy n8n on Kubernetes with Vault integration"`
+- `"Kubernetes RBAC: a practical guide for platform engineers"`
+- `"GitOps with ArgoCD and Helm on multi-cluster setups"`
 
 ---
 
-## Alternatives to PostgreSQL Topic Queue
+## Environment Variables Reference
 
-| Method | Pros | Cons | Best For |
-|--------|------|------|----------|
-| **PostgreSQL table** *(default)* | Production-grade, queryable, persistent | Requires DB setup | Any production use |
-| **Google Sheets** | Visual, easy to edit manually | Requires Google credentials, rate limits | Small teams |
-| **n8n Static Data** | Zero setup, built-in | Lost on pod restart, not queryable | Development only |
-| **Email/IMAP** | Trigger by sending an email | Polling latency, complex parsing | Personal setups |
-| **n8n Form** | Built-in UI form | Needs n8n Pro for form persistence | Quick demos |
-| **Airtable** | Spreadsheet-like, REST API | Cost, external dependency | Team collaboration |
+| Variable | Source | Description |
+|----------|--------|-------------|
+| `N8N_ENCRYPTION_KEY` | Vault `secret/n8n/core` | Encrypts n8n credentials at rest |
+| `DB_POSTGRESDB_PASSWORD` | Vault `secret/n8n/postgres` | PostgreSQL password |
+| `QUEUE_BULL_REDIS_PASSWORD` | Vault `secret/n8n/redis` | Redis auth password |
+| `N8N_SMTP_PASS` | Vault `secret/n8n/smtp` | SMTP/Gmail app password |
+| `LLM_API_KEY` | Vault `secret/n8n/llm` | OpenAI/Anthropic API key |
+| `DEV_TOKEN` | Vault `secret/n8n/devto` | Dev.to API token (optional) |
+| `N8N_HOST` | ConfigMap | n8n hostname |
+| `WEBHOOK_URL` | ConfigMap | Full URL for webhooks |
+| `GENERIC_TIMEZONE` | ConfigMap | Timezone (e.g., `Europe/Berlin`) |
+| `EXECUTIONS_MODE` | ConfigMap | Must be `queue` |
+| `QUEUE_BULL_REDIS_HOST` | ConfigMap | Redis service hostname |
+| `DB_TYPE` | ConfigMap | Must be `postgresdb` |
 
 ---
 
 ## Operational Best Practices
 
-### Monitoring
+### Scaling
 
 ```bash
-# Watch all n8n pods
-watch kubectl get pods -n n8n
+# Scale workers up during heavy load
+kubectl scale deployment n8n-worker -n n8n --replicas=4
 
-# Follow n8n main logs
-kubectl logs -n n8n deploy/n8n-main -f
-
-# Check execution queue depth (Redis)
-kubectl exec -n n8n deploy/redis -- sh -c \
-  'PASS=$(cat /vault/secrets/redis | tr -d "[:space:]"); redis-cli -a "$PASS" llen bull:jobs:wait'
-```
-
-### Backup Strategy
-
-```bash
-# PostgreSQL backup
-kubectl exec -n n8n deploy/postgres -- \
-  pg_dump -U n8n n8n > n8n-backup-$(date +%Y%m%d).sql
-
-# n8n data backup (workflows and credentials)
-kubectl cp n8n/$(kubectl get pod -n n8n -l app.kubernetes.io/name=n8n,app.kubernetes.io/component=main -o name | head -1 | cut -d/ -f2):/home/node/.n8n ./n8n-data-backup
-```
-
-### Scaling Workers
-
-```bash
-# Manual scale
-kubectl scale deployment n8n-worker -n n8n --replicas=5
-
-# HPA handles auto-scaling based on CPU/memory (min 2, max 10)
+# The HPA will auto-scale between 2-5 workers based on CPU/memory
 kubectl get hpa -n n8n
 ```
 
-### Updating n8n
+### Backups
 
 ```bash
-# Rolling update to latest
+# Backup PostgreSQL data
+kubectl exec -n n8n \
+  $(kubectl get pod -n n8n -l app=n8n-postgres -o jsonpath='{.items[0].metadata.name}') \
+  -- pg_dump -U n8n n8n | gzip > n8n-db-$(date +%Y%m%d).sql.gz
+
+# Backup n8n data volume (workflows, credentials)
+kubectl cp n8n/$(kubectl get pod -n n8n -l app=n8n-main \
+  -o jsonpath='{.items[0].metadata.name}'):/home/node/.n8n ./n8n-data-backup-$(date +%Y%m%d)
+```
+
+### Rolling Updates
+
+```bash
+# Update n8n to latest
 kubectl set image deployment/n8n-main n8n=n8nio/n8n:latest -n n8n
 kubectl set image deployment/n8n-worker n8n-worker=n8nio/n8n:latest -n n8n
 kubectl rollout status deployment/n8n-main -n n8n
+```
+
+### Monitoring
+
+```bash
+# Pod status
+kubectl get pods -n n8n -w
+
+# n8n main logs
+kubectl logs -n n8n -l app=n8n-main --tail=100 -f
+
+# Worker logs
+kubectl logs -n n8n -l app=n8n-worker --tail=100 -f
+
+# PostgreSQL logs
+kubectl logs -n n8n -l app=n8n-postgres --tail=50
+
+# Resource usage
+kubectl top pods -n n8n
 ```
 
 ---
 
 ## Security Recommendations
 
-1. **Never hardcode secrets in manifests** — all sensitive values come from Vault via agent injection.
+1. **Vault token rotation:** Vault leases auto-renew (TTL: 1h, max: 24h). For long-running pods, configure Vault Agent for lease renewal.
 
-2. **Use Vault leases** — the n8n Kubernetes role has a 1h TTL. Vault Agent renews automatically.
+2. **Network isolation:** The NetworkPolicy restricts:
+   - n8n to only reach Postgres, Redis, Vault, and internet (for APIs)
+   - No direct pod-to-pod access outside n8n namespace
 
-3. **Restrict network access:**
+3. **Webhook security:** Add webhook authentication to the topic input webhook:
+   - In n8n UI, edit Webhook node → Authentication → Header Auth
+   - Add `X-Webhook-Secret: <token>` to your curl calls
+
+4. **RBAC least privilege:** The `n8n-sa` service account has only the minimum permissions needed for Vault authentication.
+
+5. **Image pinning:** Replace `n8nio/n8n:latest` with a specific version in production:
    ```yaml
-   # Add NetworkPolicy to restrict postgres/redis access
-   # Only n8n pods should reach postgres:5432 and redis:6379
+   image: n8nio/n8n:1.68.0
    ```
 
-4. **Enable n8n user management** — create individual user accounts instead of using basic auth alone.
+6. **Secrets in memory only:** All Vault-injected secrets use `emptyDir: { medium: Memory }` — they are never persisted to disk on the node.
 
-5. **Rotate secrets regularly:**
+7. **PostgreSQL hardening:** The init script creates a dedicated `n8n` user (not superuser). Consider enabling SSL for PostgreSQL connections.
+
+8. **Audit logging:** Enable Vault audit logging:
    ```bash
-   # Rotate encryption key (requires re-encryption of stored credentials)
-   kubectl exec -n vault vault-0 -- vault kv patch secret/n8n/core \
-     encryption_key="$(openssl rand -base64 32)"
+   kubectl exec -n vault vault-0 -- env VAULT_TOKEN=$VAULT_ROOT_TOKEN \
+     vault audit enable file file_path=/vault/logs/audit.log
    ```
-
-6. **Use ImagePullPolicy: Always** for production — ensures latest security patches are picked up.
-
-7. **Enable Audit Logging in Vault:**
-   ```bash
-   kubectl exec -n vault vault-0 -- vault audit enable file file_path=/vault/logs/audit.log
-   ```
-
-8. **Rotate PostgreSQL/Redis passwords periodically** via Vault dynamic secrets (future enhancement).
-
-9. **TLS everywhere** — ingress terminates TLS; all internal communication is within the cluster network.
-
-10. **Limit Vault policy scope** — the `n8n-policy` grants read-only access. Workers never write to Vault.
 
 ---
 
 ## Troubleshooting
 
-### Vault Agent Not Injecting Secrets
+### Vault Agent not injecting secrets
 
 ```bash
-# Check if Vault Agent Injector is running
-kubectl get pods -n vault | grep injector
+# Check Vault Agent is running as sidecar
+kubectl describe pod -n n8n -l app=n8n-main
 
-# Check pod annotations are correct
-kubectl describe pod -n n8n <pod-name> | grep vault
+# Check Vault Agent logs
+kubectl logs -n n8n -l app=n8n-main -c vault-agent
 
-# Check vault-agent init container logs
-kubectl logs -n n8n <pod-name> -c vault-agent-init
+# Verify Kubernetes auth is configured
+kubectl exec -n vault vault-0 -- env VAULT_TOKEN=$VAULT_ROOT_TOKEN \
+  vault auth list
 
-# Verify the Kubernetes auth role exists
-kubectl exec -n vault vault-0 -- vault read auth/kubernetes/role/n8n
-
-# Verify SA token reviewer JWT is still valid
-kubectl exec -n vault vault-0 -- vault write auth/kubernetes/login \
-  role=n8n \
-  jwt=$(kubectl create token n8n-sa -n n8n)
+# Test Kubernetes auth from within a pod
+kubectl exec -it -n n8n $(kubectl get pod -n n8n -l app=n8n-main \
+  -o jsonpath='{.items[0].metadata.name}') -c n8n -- \
+  sh -c 'ls /vault/secrets/'
 ```
 
-### n8n Pods CrashLoopBackOff
+### PVCs stuck in Pending
 
 ```bash
-# Check recent events
-kubectl describe pod -n n8n <pod-name>
-
-# Check if Vault secrets were injected
-kubectl exec -n n8n <pod-name> -- ls /vault/secrets/
-
-# Check if all env vars are set
-kubectl exec -n n8n <pod-name> -- env | grep -E 'DB_|QUEUE_|N8N_'
-
-# Verify PostgreSQL connectivity
-kubectl exec -n n8n <pod-name> -- nc -zv postgres-service 5432
+kubectl describe pvc n8n-postgres-pvc -n n8n
+# Common causes:
+# - Host directory /n8n/postgres doesn't exist → run create-host-dirs.sh
+# - Node selector doesn't match any node
+# - StorageClass not found
 ```
 
-### PostgreSQL Connection Errors
+### n8n can't connect to PostgreSQL
 
 ```bash
-# Test connection from n8n pod
-kubectl exec -n n8n deploy/n8n-main -- \
-  sh -c '. /vault/secrets/postgres && echo "Password: $DB_POSTGRESDB_PASSWORD"'
+# Test from n8n pod
+kubectl exec -it -n n8n $(kubectl get pod -n n8n -l app=n8n-main \
+  -o jsonpath='{.items[0].metadata.name}') -c n8n -- \
+  nc -zv n8n-postgres-svc 5432
 
-# Connect directly to postgres
-kubectl exec -n n8n deploy/postgres -- psql -U n8n -d n8n -c '\dt'
+# Check postgres pod is running
+kubectl get pods -n n8n -l app=n8n-postgres
 
 # Check postgres logs
-kubectl logs -n n8n deploy/postgres --tail=50
+kubectl logs -n n8n -l app=n8n-postgres -c postgres
 ```
 
-### Redis Queue Issues
+### n8n can't connect to Redis
 
 ```bash
-# Check Redis connectivity
-kubectl exec -n n8n deploy/redis -- sh -c \
-  'PASS=$(cat /vault/secrets/redis | tr -d "[:space:]"); redis-cli -a "$PASS" ping'
-
-# Check queue depth
-kubectl exec -n n8n deploy/redis -- sh -c \
-  'PASS=$(cat /vault/secrets/redis | tr -d "[:space:]"); redis-cli -a "$PASS" keys "bull*"'
-
-# Check if workers are consuming jobs
-kubectl logs -n n8n deploy/n8n-worker --tail=30 | grep -E 'job|queue'
+kubectl exec -it -n n8n $(kubectl get pod -n n8n -l app=n8n-worker \
+  -o jsonpath='{.items[0].metadata.name}') -c n8n-worker -- \
+  nc -zv n8n-redis-svc 6379
 ```
 
-### Scheduling Not Firing
+### Workflow not triggering on schedule
 
 ```bash
-# Verify timezone is set correctly
-kubectl exec -n n8n deploy/n8n-main -- env | grep TIMEZONE
+# Check n8n timezone
+kubectl exec -n n8n $(kubectl get pod -n n8n -l app=n8n-main \
+  -o jsonpath='{.items[0].metadata.name}') -c n8n -- \
+  sh -c 'echo $GENERIC_TIMEZONE && date'
 
-# Check n8n scheduler logs
-kubectl logs -n n8n deploy/n8n-main | grep -i schedule
-
-# Manually trigger the workflow to test
-# In n8n UI: open Workflow 02 → click "Execute Workflow"
+# Ensure workflow is ACTIVE in n8n UI
+# Verify cron expression at: https://crontab.guru/#0_9_*_*_1,3,5
 ```
 
-### PVC Stuck in Pending
+### Email not being sent
 
 ```bash
-# Check PVC status
-kubectl get pvc -n n8n
+# Test SMTP from within the cluster
+kubectl exec -it -n n8n $(kubectl get pod -n n8n -l app=n8n-main \
+  -o jsonpath='{.items[0].metadata.name}') -c n8n -- \
+  nc -zv smtp.gmail.com 587
 
-# Check PV status
-kubectl get pv | grep n8n
-
-# Check if node label matches
-kubectl get node --show-labels | grep hostname
-
-# Describe PVC for error details
-kubectl describe pvc n8n-data-pvc -n n8n
+# Check SMTP env vars are populated
+kubectl exec -n n8n $(kubectl get pod -n n8n -l app=n8n-main \
+  -o jsonpath='{.items[0].metadata.name}') -c n8n -- \
+  sh -c 'cat /vault/secrets/n8n-smtp-env'
 ```
 
-### Email Not Sending
+### Workers not picking up jobs
 
 ```bash
-# Test SMTP from inside the cluster
-kubectl run smtp-test --image=alpine --rm -it --restart=Never -- \
-  sh -c "apk add openssl && openssl s_client -connect smtp.gmail.com:587 -starttls smtp"
+# Verify worker mode
+kubectl exec -n n8n $(kubectl get pod -n n8n -l app=n8n-worker \
+  -o jsonpath='{.items[0].metadata.name}') -c n8n-worker -- \
+  sh -c 'echo $EXECUTIONS_MODE'
 
-# Check n8n email node error in execution logs (n8n UI)
-# Settings → Executions → find the failed execution
+# Check Redis queue
+kubectl exec -it -n n8n $(kubectl get pod -n n8n -l app=n8n-redis \
+  -o jsonpath='{.items[0].metadata.name}') -c redis -- \
+  sh -c 'PASS=$(cat /vault/secrets/redis-password); redis-cli -a $PASS keys "bull:*" | head -20'
 ```
 
 ---
 
-## Run the Diagnostic Script
+## Alternative Topic Storage Options
 
-```bash
-chmod +x scripts/troubleshoot.sh
-./scripts/troubleshoot.sh
-```
+While PostgreSQL is recommended for production, here are alternatives:
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **PostgreSQL** (this impl) | Durable, SQL queries, retry logic | Requires DB credential in n8n |
+| **Google Sheets** | Easy to edit manually | Requires Google OAuth, external dependency |
+| **n8n Variables** | Built-in, no setup | Limited to simple key/value, not persistent across restarts |
+| **Email (IMAP)** | No extra infra | Polling latency, format parsing complexity |
+| **Airtable** | Nice UI | External SaaS, potential cost |
+| **Notion DB** | Rich metadata | External SaaS, OAuth required |
+
+To switch to Google Sheets: replace the PostgreSQL nodes with n8n's built-in Google Sheets nodes, using a sheet with columns: `topic`, `status`, `created_at`.
 
 ---
 
-*Generated for n8n self-hosted on Kubernetes with HashiCorp Vault integration.*  
-*Architecture: n8n + PostgreSQL + Redis queue mode + Vault Agent injection + local PVs.*
+## License
+
+MIT

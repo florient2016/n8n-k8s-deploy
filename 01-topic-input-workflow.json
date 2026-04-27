@@ -1,19 +1,20 @@
 {
-  "name": "01 - Topic Input Workflow",
+  "name": "1 - Topic Input (Submit Article Topic)",
   "nodes": [
     {
       "parameters": {
         "httpMethod": "POST",
-        "path": "article-topic",
-        "responseMode": "responseNode",
+        "path": "submit-topic",
+        "responseMode": "lastNode",
         "options": {}
       },
-      "name": "Webhook - Receive Topic",
+      "id": "webhook-node",
+      "name": "Webhook: Receive Topic",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 1,
-      "position": [240, 300],
-      "webhookId": "article-topic-input",
-      "notes": "POST /webhook/article-topic\nBody: { topic, description, priority }"
+      "position": [250, 300],
+      "webhookId": "submit-topic",
+      "notes": "POST /webhook/submit-topic\nBody: { \"topic\": \"Write about ROSA HCP vs Classic\", \"scheduled_at\": \"2025-01-15T10:00:00Z\" }"
     },
     {
       "parameters": {
@@ -26,23 +27,26 @@
           ]
         }
       },
+      "id": "validate-node",
       "name": "Validate Input",
       "type": "n8n-nodes-base.if",
       "typeVersion": 1,
-      "position": [460, 300]
+      "position": [500, 300]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO article_topics (topic, description, priority)\nVALUES (\n  '{{ $json.body.topic.replace(/'/g, \"''\") }}',\n  '{{ ($json.body.description || '').replace(/'/g, \"''\") }}',\n  {{ $json.body.priority || 5 }}\n)\nRETURNING id, topic, status, created_at;",
+        "query": "INSERT INTO article_topics (topic, status, scheduled_at)\nVALUES (\n  '{{ $json.body.topic }}',\n  'pending',\n  {{ $json.body.scheduled_at ? \"'\" + $json.body.scheduled_at + \"'\" : 'NULL' }}\n)\nRETURNING id, topic, status, created_at;",
         "additionalFields": {}
       },
-      "name": "Insert Topic to DB",
+      "id": "insert-topic-node",
+      "name": "Insert Topic to PostgreSQL",
       "type": "n8n-nodes-base.postgres",
-      "typeVersion": 1,
-      "position": [680, 220],
+      "typeVersion": 2,
+      "position": [750, 200],
       "credentials": {
         "postgres": {
+          "id": "postgres-cred",
           "name": "n8n PostgreSQL"
         }
       }
@@ -50,45 +54,75 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ success: true, message: 'Topic queued successfully', id: $json.id, topic: $json.topic, status: $json.status }) }}"
+        "responseBody": "={\n  \"success\": true,\n  \"message\": \"Topic queued successfully\",\n  \"id\": {{ $json.id }},\n  \"topic\": \"{{ $json.topic }}\",\n  \"status\": \"{{ $json.status }}\",\n  \"created_at\": \"{{ $json.created_at }}\"\n}"
       },
-      "name": "Respond - Success",
+      "id": "success-response-node",
+      "name": "Success Response",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
-      "position": [900, 220]
+      "position": [1000, 200]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={ \"success\": false, \"error\": \"topic field is required\" }",
+        "responseBody": "{\n  \"success\": false,\n  \"error\": \"topic field is required and must not be empty\"\n}",
         "options": {
           "responseCode": 400
         }
       },
-      "name": "Respond - Validation Error",
+      "id": "error-response-node",
+      "name": "Error Response",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
-      "position": [680, 400]
+      "position": [750, 450]
     }
   ],
   "connections": {
-    "Webhook - Receive Topic": {
-      "main": [[{ "node": "Validate Input", "type": "main", "index": 0 }]]
+    "Webhook: Receive Topic": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Validate Input": {
       "main": [
-        [{ "node": "Insert Topic to DB", "type": "main", "index": 0 }],
-        [{ "node": "Respond - Validation Error", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Insert Topic to PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Insert Topic to DB": {
-      "main": [[{ "node": "Respond - Success", "type": "main", "index": 0 }]]
+    "Insert Topic to PostgreSQL": {
+      "main": [
+        [
+          {
+            "node": "Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
-  "active": true,
   "settings": {
-    "executionOrder": "v1"
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": ""
   },
-  "tags": ["article-automation"],
-  "notes": "Webhook to submit article topics into the PostgreSQL queue.\nUsage: POST https://n8n.example.com/webhook/article-topic\n{ \"topic\": \"Your article topic\", \"description\": \"Optional context\", \"priority\": 1 }"
+  "tags": ["article-automation", "input"]
 }

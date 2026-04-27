@@ -1,221 +1,196 @@
 #!/usr/bin/env bash
 # =============================================================================
-# vault/01-vault-setup.sh
-# Configure HashiCorp Vault for n8n on Kubernetes
-# Run this ONCE from your local machine (kubectl access required)
+# Vault Setup Script for n8n on Kubernetes
+# Run this ONCE from your local machine with kubectl configured
 # =============================================================================
 set -euo pipefail
 
-# ─── Prerequisites ────────────────────────────────────────────────────────────
-command -v kubectl >/dev/null 2>&1 || { echo "kubectl not found"; exit 1; }
+# ---------------------------------------------------------------------------
+# REQUIRED: Set these environment variables before running
+# ---------------------------------------------------------------------------
+: "${VAULT_ROOT_TOKEN:?VAULT_ROOT_TOKEN must be set}"
+: "${N8N_ENCRYPTION_KEY:?N8N_ENCRYPTION_KEY must be set}"
+: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
+: "${SMTP_PASSWORD:?SMTP_PASSWORD must be set}"
+: "${LLM_API_KEY:?LLM_API_KEY must be set}"
 
-echo "======================================================"
-echo " n8n on Kubernetes — Vault Setup"
-echo "======================================================"
+# Optional
+DEV_TOKEN="${DEV_TOKEN:-}"
 
-# ─── 1. Collect cluster info ──────────────────────────────────────────────────
-echo "[1/8] Collecting cluster information..."
+VAULT_NAMESPACE="vault"
+VAULT_POD="vault-0"
+N8N_NAMESPACE="n8n"
 
-KUBE_HOST=$(kubectl cluster-info | grep 'Kubernetes control' | awk '{print $NF}')
+echo "========================================="
+echo "  n8n Vault Setup"
+echo "========================================="
+
+# ---------------------------------------------------------------------------
+# Step 1: Collect Kubernetes cluster information
+# ---------------------------------------------------------------------------
+echo "[1/6] Collecting Kubernetes cluster info..."
+
+KUBE_HOST=$(kubectl cluster-info | grep 'Kubernetes control' | awk '{print $NF}' | sed 's/\x1b\[[0-9;]*m//g')
+KUBE_CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode)
+
 echo "  Kubernetes API: ${KUBE_HOST}"
 
-KUBE_CA=$(kubectl config view --raw \
-  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode)
-
-echo "[2/8] Collecting Vault service account JWT from vault-0 pod..."
-VAULT_SA_JWT=$(kubectl exec -n vault vault-0 -- \
+echo "[2/6] Getting Vault service account JWT..."
+VAULT_SA_JWT=$(kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- \
   cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 echo "  JWT (first 50 chars): ${VAULT_SA_JWT:0:50}..."
 
-# ─── 2. Collect secrets from environment variables ───────────────────────────
-echo ""
-echo "[3/8] Collecting secret values from environment variables..."
-echo "      (Set these before running to avoid interactive prompts)"
-echo ""
-echo "  Required env vars:"
-echo "    export VAULT_ROOT_TOKEN=..."
-echo "    export N8N_ENCRYPTION_KEY=..."
-echo "    export POSTGRES_PASSWORD=..."
-echo "    export REDIS_PASSWORD=..."
-echo "    export SMTP_PASSWORD=..."
-echo "    export LLM_API_KEY=..."
-echo "    export MEDIUM_TOKEN=...   (optional)"
-echo ""
+# ---------------------------------------------------------------------------
+# Step 2: Create Vault policy file and copy to vault pod
+# ---------------------------------------------------------------------------
+echo "[3/6] Creating Vault policy..."
 
-# Helper: read from env var or fall back to hidden prompt
-require_secret() {
-  local var_name="$1"
-  local prompt_label="$2"
-  local value="${!var_name:-}"
-
-  if [[ -n "${value}" ]]; then
-    echo "  ✓ ${var_name} loaded from environment"
-  else
-    read -rp "  ${prompt_label}: " -s value; echo ""
-    if [[ -z "${value}" ]]; then
-      echo "  ERROR: ${var_name} is required but was not provided." >&2
-      exit 1
-    fi
-  fi
-  # Export back so callers can use it
-  export "${var_name}=${value}"
-}
-
-optional_secret() {
-  local var_name="$1"
-  local prompt_label="$2"
-  local value="${!var_name:-}"
-
-  if [[ -n "${value}" ]]; then
-    echo "  ✓ ${var_name} loaded from environment"
-  else
-    read -rp "  ${prompt_label} (leave blank to skip): " -s value; echo ""
-    export "${var_name}=${value:-DISABLED}"
-  fi
-}
-
-require_secret  VAULT_ROOT_TOKEN    "Vault ROOT_TOKEN"
-require_secret  N8N_ENCRYPTION_KEY  "n8n Encryption Key (32+ chars)"
-require_secret  POSTGRES_PASSWORD   "PostgreSQL password"
-require_secret  REDIS_PASSWORD      "Redis password"
-require_secret  SMTP_PASSWORD       "SMTP / Gmail App Password"
-require_secret  LLM_API_KEY         "LLM API Key (OpenAI/Anthropic/etc)"
-optional_secret MEDIUM_TOKEN        "Medium Integration Token"
-
-echo ""
-echo "  All secrets collected."
-
-# ─── 3. Enable Vault KV secrets engine ───────────────────────────────────────
-echo ""
-echo "[4/8] Enabling KV-v2 secrets engine at 'secret/'..."
-
-kubectl exec -n vault vault-0 -- \
-  vault login -no-print "${VAULT_ROOT_TOKEN}"
-
-kubectl exec -n vault vault-0 -- \
-  vault secrets enable -path=secret kv-v2 2>/dev/null || \
-  echo "  KV-v2 already enabled, skipping."
-
-# ─── 4. Write secrets ─────────────────────────────────────────────────────────
-echo "[5/8] Writing secrets to Vault..."
-
-# n8n core secrets
-kubectl exec -n vault vault-0 -- \
-  vault kv put secret/n8n/core \
-    encryption_key="${N8N_ENCRYPTION_KEY}"
-
-# PostgreSQL
-kubectl exec -n vault vault-0 -- \
-  vault kv put secret/n8n/postgres \
-    password="${POSTGRES_PASSWORD}" \
-    user="n8n" \
-    db="n8n" \
-    host="postgres-service.n8n.svc.cluster.local" \
-    port="5432"
-
-# Redis
-kubectl exec -n vault vault-0 -- \
-  vault kv put secret/n8n/redis \
-    password="${REDIS_PASSWORD}" \
-    host="redis-service.n8n.svc.cluster.local" \
-    port="6379"
-
-# SMTP / Email
-kubectl exec -n vault vault-0 -- \
-  vault kv put secret/n8n/smtp \
-    password="${SMTP_PASSWORD}"
-
-# LLM
-kubectl exec -n vault vault-0 -- \
-  vault kv put secret/n8n/llm \
-    api_key="${LLM_API_KEY}"
-
-# Medium (optional — write empty if not provided)
-if [[ -n "${MEDIUM_TOKEN}" ]]; then
-  kubectl exec -n vault vault-0 -- \
-    vault kv put secret/n8n/medium \
-      token="${MEDIUM_TOKEN}"
-  echo "  Medium token stored."
-else
-  kubectl exec -n vault vault-0 -- \
-    vault kv put secret/n8n/medium \
-      token="DISABLED"
-  echo "  Medium token skipped (set to DISABLED)."
-fi
-
-echo "  Secrets written successfully."
-
-# ─── 5. Write Vault policy ───────────────────────────────────────────────────
-echo "[6/8] Creating Vault policy for n8n..."
-
-cat <<'EOF' > /tmp/n8n-vault-policy.hcl
-# n8n secrets policy
-# Grants read access to all n8n secret paths
-
+cat > /tmp/n8n-policy.hcl << 'POLICY'
+# n8n application secrets - read only
 path "secret/data/n8n/*" {
   capabilities = ["read", "list"]
 }
 
-path "secret/metadata/n8n/*" {
-  capabilities = ["read", "list"]
+# Allow token renewal
+path "auth/token/renew-self" {
+  capabilities = ["update"]
 }
-EOF
 
-kubectl cp /tmp/n8n-vault-policy.hcl vault/vault-0:/tmp/n8n-vault-policy.hcl
+# Allow token lookup
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+POLICY
 
-kubectl exec -n vault vault-0 -- \
-  vault policy write n8n-policy /tmp/n8n-vault-policy.hcl
+kubectl cp /tmp/n8n-policy.hcl "${VAULT_NAMESPACE}/${VAULT_POD}:/tmp/n8n-policy.hcl"
+echo "  Policy file copied to vault pod."
 
-echo "  Policy 'n8n-policy' created."
+# ---------------------------------------------------------------------------
+# Step 3: Configure Vault (all commands via kubectl exec)
+# ---------------------------------------------------------------------------
+echo "[4/6] Configuring Vault via kubectl exec..."
 
-# ─── 6. Enable Kubernetes auth ───────────────────────────────────────────────
-echo "[7/8] Configuring Vault Kubernetes authentication..."
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+  vault auth list > /dev/null 2>&1 || true
 
-kubectl exec -n vault vault-0 -- \
+# Enable KV v2 secrets engine
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+  vault secrets enable -path=secret kv-v2 2>/dev/null || \
+  echo "  KV v2 already enabled at 'secret/'"
+
+# Write the policy from the copied file
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+  vault policy write n8n /tmp/n8n-policy.hcl
+
+echo "  Vault policy 'n8n' written."
+
+# ---------------------------------------------------------------------------
+# Step 4: Write secrets to Vault
+# ---------------------------------------------------------------------------
+echo "[5/6] Writing secrets to Vault..."
+
+# Core n8n secrets
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+  vault kv put secret/n8n/core \
+  encryption_key="${N8N_ENCRYPTION_KEY}"
+
+# PostgreSQL
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+  vault kv put secret/n8n/postgres \
+  password="${POSTGRES_PASSWORD}" \
+  host="n8n-postgres-svc.${N8N_NAMESPACE}.svc.cluster.local" \
+  port="5432" \
+  database="n8n" \
+  user="n8n"
+
+# Redis
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+  vault kv put secret/n8n/redis \
+  password="${REDIS_PASSWORD}" \
+  host="n8n-redis-svc.${N8N_NAMESPACE}.svc.cluster.local" \
+  port="6379"
+
+# SMTP / Email
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+  vault kv put secret/n8n/smtp \
+  password="${SMTP_PASSWORD}"
+
+# LLM API Key
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+  vault kv put secret/n8n/llm \
+  api_key="${LLM_API_KEY}"
+
+# Dev.to token (optional)
+if [[ -n "${DEV_TOKEN}" ]]; then
+  kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+    VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+    vault kv put secret/n8n/devto \
+    token="${DEV_TOKEN}"
+  echo "  Dev.to token written."
+else
+  echo "  Skipping Dev.to token (DEV_TOKEN not set)."
+fi
+
+echo "  All secrets written to Vault."
+
+# ---------------------------------------------------------------------------
+# Step 5: Enable Kubernetes Auth and create role
+# ---------------------------------------------------------------------------
+echo "[6/6] Configuring Kubernetes auth backend..."
+
+# Enable Kubernetes auth (idempotent)
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
   vault auth enable kubernetes 2>/dev/null || \
-  echo "  Kubernetes auth already enabled, skipping."
+  echo "  Kubernetes auth already enabled."
 
-# Write CA cert to a temp file in the pod
-echo "${KUBE_CA}" > /tmp/kube-ca.crt
-kubectl cp /tmp/kube-ca.crt vault/vault-0:/tmp/kube-ca.crt
-
-kubectl exec -n vault vault-0 -- \
+# Configure Kubernetes auth backend
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
   vault write auth/kubernetes/config \
-    token_reviewer_jwt="${VAULT_SA_JWT}" \
-    kubernetes_host="${KUBE_HOST}" \
-    kubernetes_ca_cert=@/tmp/kube-ca.crt \
-    issuer="https://kubernetes.default.svc.cluster.local"
+  token_reviewer_jwt="${VAULT_SA_JWT}" \
+  kubernetes_host="${KUBE_HOST}" \
+  kubernetes_ca_cert="${KUBE_CA}" \
+  issuer="https://kubernetes.default.svc.cluster.local"
 
 echo "  Kubernetes auth configured."
 
-# ─── 7. Create Kubernetes auth role ──────────────────────────────────────────
-echo "[8/8] Creating Vault auth role for n8n service account..."
-
-kubectl exec -n vault vault-0 -- \
+# Create Vault role for n8n
+kubectl exec -n "${VAULT_NAMESPACE}" "${VAULT_POD}" -- env \
+  VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
   vault write auth/kubernetes/role/n8n \
-    bound_service_account_names="n8n-sa" \
-    bound_service_account_namespaces="n8n" \
-    policies="n8n-policy" \
-    ttl="1h"
+  bound_service_account_names="n8n-sa" \
+  bound_service_account_namespaces="${N8N_NAMESPACE}" \
+  policies="n8n" \
+  ttl="1h" \
+  max_ttl="24h"
 
-echo "  Vault role 'n8n' bound to SA 'n8n-sa' in namespace 'n8n'."
+echo "  Vault role 'n8n' created."
 
-# ─── Done ─────────────────────────────────────────────────────────────────────
-echo ""
-echo "======================================================"
-echo " Vault setup complete!"
-echo ""
-echo " Secrets written:"
-echo "   secret/n8n/core         (encryption_key)"
-echo "   secret/n8n/postgres     (password, user, db, host, port)"
-echo "   secret/n8n/redis        (password, host, port)"
-echo "   secret/n8n/smtp         (password)"
-echo "   secret/n8n/llm          (api_key)"
-echo "   secret/n8n/medium       (token)"
-echo ""
-echo " Auth role: n8n → n8n-policy"
-echo " Next step: apply Kubernetes manifests"
-echo "======================================================"
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+rm -f /tmp/n8n-policy.hcl
 
-# Cleanup temp files
-rm -f /tmp/n8n-vault-policy.hcl /tmp/kube-ca.crt
+echo ""
+echo "========================================="
+echo "  Vault setup COMPLETE"
+echo "========================================="
+echo ""
+echo "Next steps:"
+echo "  1. Create namespace:  kubectl create namespace ${N8N_NAMESPACE}"
+echo "  2. Apply RBAC:        kubectl apply -f k8s/rbac/"
+echo "  3. Apply storage:     kubectl apply -f k8s/storage/"
+echo "  4. Deploy Postgres:   kubectl apply -f k8s/postgres/"
+echo "  5. Deploy Redis:      kubectl apply -f k8s/redis/"
+echo "  6. Deploy n8n:        kubectl apply -f k8s/n8n/"
+echo "  7. Apply Ingress:     kubectl apply -f k8s/ingress/"

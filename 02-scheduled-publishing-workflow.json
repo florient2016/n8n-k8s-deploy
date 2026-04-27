@@ -1,5 +1,5 @@
 {
-  "name": "02 - Scheduled Article Publishing",
+  "name": "2 - Scheduled Article Publisher (3x/week)",
   "nodes": [
     {
       "parameters": {
@@ -7,32 +7,32 @@
           "interval": [
             {
               "field": "cronExpression",
-              "expression": "0 8 * * 1,3,5"
+              "expression": "0 9 * * 1,3,5"
             }
           ]
         }
       },
       "id": "schedule-trigger",
-      "name": "Schedule - 3x Per Week",
+      "name": "Schedule: Mon/Wed/Fri 9am",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1,
-      "position": [240, 300],
-      "notes": "Runs Mon/Wed/Fri at 08:00 UTC\nCron: 0 8 * * 1,3,5\nAdjust in ConfigMap: GENERIC_TIMEZONE"
+      "position": [250, 300],
+      "notes": "Runs every Monday, Wednesday, Friday at 09:00.\nCron: 0 9 * * 1,3,5\nChange timezone in n8n settings: GENERIC_TIMEZONE"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT id, topic, retry_count\nFROM article_topics\nWHERE status = 'pending'\n  AND retry_count < 3\nORDER BY created_at ASC\nLIMIT 1;",
-        "options": {}
+        "query": "SELECT id, topic, retry_count\nFROM article_topics\nWHERE status = 'pending'\n  AND (scheduled_at IS NULL OR scheduled_at <= NOW())\nORDER BY created_at ASC\nLIMIT 1\nFOR UPDATE SKIP LOCKED;",
+        "additionalFields": {}
       },
-      "id": "postgres-fetch-topic",
-      "name": "PostgreSQL - Fetch Next Topic",
+      "id": "fetch-topic-node",
+      "name": "Fetch Next Pending Topic",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2,
-      "position": [460, 300],
+      "position": [500, 300],
       "credentials": {
         "postgres": {
-          "id": "postgres-creds",
+          "id": "postgres-cred",
           "name": "n8n PostgreSQL"
         }
       }
@@ -49,93 +49,88 @@
           ]
         }
       },
-      "id": "if-topic-exists",
-      "name": "IF - Topic Exists?",
+      "id": "has-topic-check",
+      "name": "Topic Available?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 1,
-      "position": [680, 300]
+      "position": [750, 300],
+      "notes": "If no pending topic, stop gracefully"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE article_topics SET status = 'processing', scheduled_at = NOW() WHERE id = {{ $json[0].id }} RETURNING id, topic;",
-        "options": {}
+        "query": "UPDATE article_topics\nSET status = 'processing', scheduled_at = NOW()\nWHERE id = {{ $json[0].id }}\nRETURNING id, topic;",
+        "additionalFields": {}
       },
-      "id": "postgres-mark-processing",
-      "name": "PostgreSQL - Mark Processing",
+      "id": "mark-processing-node",
+      "name": "Mark Topic as Processing",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2,
-      "position": [900, 200],
+      "position": [1000, 200],
       "credentials": {
         "postgres": {
-          "id": "postgres-creds",
+          "id": "postgres-cred",
           "name": "n8n PostgreSQL"
         }
       }
     },
     {
       "parameters": {
-        "resource": "chat",
-        "operation": "complete",
-        "model": "gpt-4o",
-        "messages": {
-          "values": [
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 120000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
             {
-              "role": "system",
-              "content": "You are an expert technical writer and software engineer. You write clear, in-depth, well-structured blog articles for platforms like Medium, Dev.to, and personal engineering blogs.\n\nYour articles:\n- Are targeted at senior engineers and DevOps practitioners\n- Include real-world examples, code snippets, architecture diagrams (described), and practical advice\n- Follow a clear structure: Introduction, Problem Statement, Architecture, Step-by-Step Guide, Best Practices, Conclusion\n- Use proper Markdown formatting with headers (##, ###), code blocks (```), lists, and bold emphasis\n- Are between 1500-2500 words\n- Begin with a compelling introduction that establishes the context and value\n- End with a strong conclusion and call to action\n\nFormat the article in Medium-ready Markdown."
-            },
-            {
-              "role": "user",
-              "content": "Write a comprehensive technical blog article about the following topic:\n\n**Topic:** {{ $('PostgreSQL - Mark Processing').item.json.topic }}\n\nRequirements:\n1. Minimum 1500 words, target 2000 words\n2. Include practical code examples and configuration snippets\n3. Structure with clear ##  headings\n4. Include a TL;DR section at the top\n5. Include a 'Getting Started' prerequisites section\n6. Include real-world architectural considerations\n7. End with a conclusion and next steps\n8. Format for Medium publication (Markdown)\n\nAlso provide:\n- A compelling article TITLE (not the raw topic)\n- A 2-sentence meta description for SEO\n- 5 relevant tags for Medium"
+              "name": "Content-Type",
+              "value": "application/json"
             }
           ]
         },
-        "options": {
-          "temperature": 0.7,
-          "maxTokens": 4000
-        }
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o\",\n  \"max_tokens\": 4000,\n  \"temperature\": 0.7,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are an expert technical writer specializing in cloud infrastructure, DevOps, Kubernetes, and platform engineering. Write engaging, in-depth technical blog posts that are practical, well-structured, and suitable for publication on Dev.to. Include code examples where relevant. Format output as valid Markdown.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Write a comprehensive technical blog article about the following topic:\\n\\n{{ $json[0].topic }}\\n\\nThe article should:\\n- Have an engaging title as an H1 heading\\n- Include a brief TL;DR summary\\n- Have clearly structured sections with H2/H3 headings\\n- Include practical examples, code snippets, or diagrams where applicable\\n- Be between 1500 and 2500 words\\n- End with a conclusion and call to action\\n- Use tags relevant to the topic for Dev.to publishing\\n\\nAt the end of the article, on a new line, provide 5 relevant Dev.to tags in this exact format:\\nTAGS: tag1, tag2, tag3, tag4, tag5\"\n    }\n  ]\n}"
       },
-      "id": "openai-generate-article",
-      "name": "OpenAI - Generate Article",
-      "type": "n8n-nodes-base.openAi",
-      "typeVersion": 1,
-      "position": [1120, 200],
-      "credentials": {
-        "openAiApi": {
-          "id": "openai-creds",
-          "name": "OpenAI API"
-        }
-      },
-      "notes": "Uses GPT-4o. Switch model to claude-3-5-sonnet or other LLMs by changing credentials and node type."
+      "id": "generate-article-node",
+      "name": "Generate Article via LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1250, 200],
+      "notes": "Uses OpenAI GPT-4o. Swap URL/model for Anthropic Claude, Mistral, etc.\nCredential: HTTP Header Auth with Authorization: Bearer <LLM_API_KEY>"
     },
     {
       "parameters": {
-        "jsCode": "const rawContent = $input.item.json.message.content;\n\n// Extract article title (first # heading or first line)\nconst titleMatch = rawContent.match(/^#\\s+(.+)$/m) || rawContent.match(/\\*\\*Title:\\*\\*\\s*(.+)/m);\nconst articleTitle = titleMatch ? titleMatch[1].trim() : $('PostgreSQL - Mark Processing').item.json.topic;\n\n// Extract tags if provided\nconst tagsMatch = rawContent.match(/Tags?:.*?([\\w\\s,#-]+)(?:\\n|$)/i);\nconst tags = tagsMatch ? tagsMatch[1].split(',').map(t => t.trim().replace('#', '')) : ['devops', 'kubernetes', 'automation'];\n\n// Calculate word count\nconst wordCount = rawContent.split(/\\s+/).length;\n\n// Format timestamp\nconst now = new Date();\nconst dateStr = now.toISOString().split('T')[0];\n\nreturn [{\n  json: {\n    topic_id: $('PostgreSQL - Mark Processing').item.json.id,\n    topic: $('PostgreSQL - Mark Processing').item.json.topic,\n    article_title: articleTitle,\n    article_content: rawContent,\n    word_count: wordCount,\n    tags: tags,\n    generated_at: now.toISOString(),\n    date_str: dateStr\n  }\n}];"
+        "jsCode": "// Extract the generated article text from OpenAI response\nconst response = $input.first().json;\nconst articleRaw = response.choices[0].message.content;\n\n// Split out TAGS line\nconst lines = articleRaw.split('\\n');\nconst tagsLine = lines.find(l => l.startsWith('TAGS:'));\nconst tags = tagsLine \n  ? tagsLine.replace('TAGS:', '').trim().split(',').map(t => t.trim())\n  : ['devops', 'kubernetes', 'cloud', 'tutorial'];\n\n// Remove TAGS line from article body\nconst article = lines.filter(l => !l.startsWith('TAGS:')).join('\\n').trim();\n\n// Extract title from first H1\nconst titleMatch = article.match(/^#\\s+(.+)$/m);\nconst title = titleMatch ? titleMatch[1].trim() : 'Technical Article';\n\n// Word count\nconst wordCount = article.split(/\\s+/).length;\n\n// Get topic id from earlier node\nconst topicId = $('Mark Topic as Processing').first().json[0].id;\nconst topic   = $('Mark Topic as Processing').first().json[0].topic;\n\nreturn [\n  {\n    json: {\n      topic_id:   topicId,\n      topic:      topic,\n      title:      title,\n      article:    article,\n      tags:       tags,\n      word_count: wordCount,\n      generated_at: new Date().toISOString()\n    }\n  }\n];"
       },
-      "id": "code-format-article",
-      "name": "Code - Format Article",
+      "id": "parse-article-node",
+      "name": "Parse & Format Article",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1340, 200]
+      "position": [1500, 200]
     },
     {
       "parameters": {
-        "fromEmail": "n8n Automation <your-email@gmail.com>",
+        "fromEmail": "={{ $env.N8N_SMTP_SENDER }}",
         "toEmail": "your-email@gmail.com",
-        "subject": "=New Article Ready: {{ $json.article_title }}",
+        "subject": "=📝 New Article Ready: {{ $json.title }}",
         "emailType": "html",
-        "html": "<!DOCTYPE html>\n<html>\n<head>\n<style>\n  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; color: #333; }\n  .header { background: #663399; color: white; padding: 20px; border-radius: 8px 8px 0 0; }\n  .meta { background: #f5f5f5; padding: 15px; border-left: 4px solid #663399; margin: 20px 0; }\n  .article-body { line-height: 1.7; white-space: pre-wrap; font-family: Georgia, serif; }\n  .footer { color: #888; font-size: 0.85em; margin-top: 30px; border-top: 1px solid #eee; padding-top: 15px; }\n  code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; font-family: monospace; }\n  pre { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 6px; overflow-x: auto; }\n  h2 { color: #663399; }\n  .tags span { background: #e8d5f5; color: #663399; padding: 3px 10px; border-radius: 12px; margin-right: 5px; font-size: 0.85em; }\n</style>\n</head>\n<body>\n  <div class=\"header\">\n    <h1>📝 New Article Ready for Publishing</h1>\n    <p>Generated: {{ $json.generated_at }}</p>\n  </div>\n  <div class=\"meta\">\n    <strong>Topic:</strong> {{ $json.topic }}<br>\n    <strong>Title:</strong> {{ $json.article_title }}<br>\n    <strong>Word Count:</strong> {{ $json.word_count }} words<br>\n    <div class=\"tags\" style=\"margin-top:8px\">{{ $json.tags.map(t => '<span>#' + t + '</span>').join('') }}</div>\n  </div>\n  <div class=\"article-body\">\n{{ $json.article_content }}\n  </div>\n  <div class=\"footer\">\n    <p>Generated by n8n automation on {{ $json.date_str }}</p>\n    <p>To publish on Medium: Log in to medium.com → New Story → Paste the article content</p>\n  </div>\n</body>\n</html>",
+        "html": "=<!DOCTYPE html>\n<html>\n<head>\n  <style>\n    body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }\n    .header { background: #FF6D5A; color: white; padding: 20px; border-radius: 8px 8px 0 0; }\n    .meta { background: #f5f5f5; padding: 15px; border-left: 4px solid #FF6D5A; margin: 10px 0; }\n    .article { background: white; padding: 20px; border: 1px solid #ddd; border-radius: 4px; }\n    pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 4px; overflow-x: auto; }\n    .tags span { background: #e0f0ff; padding: 3px 8px; border-radius: 12px; margin-right: 5px; font-size: 12px; }\n    .footer { color: #888; font-size: 12px; margin-top: 20px; }\n  </style>\n</head>\n<body>\n  <div class=\"header\">\n    <h1 style=\"margin:0\">📝 New Article Generated</h1>\n    <p style=\"margin:5px 0 0\">n8n Auto-Publisher</p>\n  </div>\n  <div class=\"meta\">\n    <strong>Topic:</strong> {{ $json.topic }}<br>\n    <strong>Title:</strong> {{ $json.title }}<br>\n    <strong>Word Count:</strong> {{ $json.word_count }} words<br>\n    <strong>Generated:</strong> {{ $json.generated_at }}<br>\n    <strong>Topic ID:</strong> #{{ $json.topic_id }}\n  </div>\n  <div class=\"tags\">\n    <strong>Tags:</strong>\n    {{ $json.tags.map(t => '<span>#' + t + '</span>').join('') }}\n  </div>\n  <hr>\n  <div class=\"article\">\n    <h2>Article Content (Markdown)</h2>\n    <pre style=\"white-space: pre-wrap; font-family: monospace; font-size: 13px;\">{{ $json.article }}</pre>\n  </div>\n  <div class=\"footer\">\n    <p>Generated by n8n auto-publisher on Kubernetes. To publish on Dev.to, copy the Markdown content above.</p>\n    <p>To submit a new topic: POST https://n8n.yourdomain.com/webhook/submit-topic</p>\n  </div>\n</body>\n</html>",
         "options": {}
       },
-      "id": "email-send-article",
-      "name": "Email - Send Article",
+      "id": "send-email-node",
+      "name": "Send Article via Email",
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2,
-      "position": [1560, 200],
+      "position": [1750, 200],
       "credentials": {
         "smtp": {
-          "id": "smtp-creds",
-          "name": "SMTP Gmail"
+          "id": "smtp-cred",
+          "name": "n8n SMTP"
         }
       }
     },
@@ -144,105 +139,62 @@
         "conditions": {
           "string": [
             {
-              "value1": "={{ $env.MEDIUM_TOKEN }}",
+              "value1": "={{ $env.DEV_TOKEN || '' }}",
               "operation": "isNotEmpty"
             }
           ]
         }
       },
-      "id": "if-medium-enabled",
-      "name": "IF - Medium Token Set?",
+      "id": "dev-token-check",
+      "name": "Dev.to Token Available?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 1,
-      "position": [1780, 200],
-      "notes": "Checks if MEDIUM_TOKEN env var is set (not DISABLED)"
+      "position": [2000, 200],
+      "notes": "Optional: only publish to Dev.to if DEV_TOKEN env var is set"
     },
     {
       "parameters": {
-        "url": "https://api.medium.com/v1/users/me",
-        "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "httpHeaderAuth",
-        "options": {
-          "headers": {
-            "values": [
-              {
-                "name": "Authorization",
-                "value": "=Bearer {{ $env.MEDIUM_TOKEN }}"
-              }
-            ]
-          }
-        }
-      },
-      "id": "medium-get-user",
-      "name": "Medium - Get User ID",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
-      "position": [2000, 100],
-      "notes": "Fetches Medium user ID needed for publication"
-    },
-    {
-      "parameters": {
-        "url": "=https://api.medium.com/v1/users/{{ $json.data.id }}/posts",
         "method": "POST",
-        "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "httpHeaderAuth",
-        "sendBody": true,
-        "bodyParameters": {
+        "url": "https://dev.to/api/articles",
+        "sendHeaders": true,
+        "headerParameters": {
           "parameters": [
             {
-              "name": "title",
-              "value": "={{ $('Code - Format Article').item.json.article_title }}"
+              "name": "api-key",
+              "value": "={{ $env.DEV_TOKEN }}"
             },
             {
-              "name": "contentFormat",
-              "value": "markdown"
-            },
-            {
-              "name": "content",
-              "value": "={{ $('Code - Format Article').item.json.article_content }}"
-            },
-            {
-              "name": "tags",
-              "value": "={{ $('Code - Format Article').item.json.tags }}"
-            },
-            {
-              "name": "publishStatus",
-              "value": "draft"
+              "name": "Content-Type",
+              "value": "application/json"
             }
           ]
         },
-        "options": {
-          "headers": {
-            "values": [
-              {
-                "name": "Authorization",
-                "value": "=Bearer {{ $env.MEDIUM_TOKEN }}"
-              }
-            ]
-          }
-        }
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"article\": {\n    \"title\": \"{{ $('Parse & Format Article').first().json.title }}\",\n    \"body_markdown\": {{ JSON.stringify($('Parse & Format Article').first().json.article) }},\n    \"published\": false,\n    \"tags\": {{ JSON.stringify($('Parse & Format Article').first().json.tags.slice(0,4)) }},\n    \"series\": \"Auto-Published\"\n  }\n}",
+        "options": {}
       },
-      "id": "medium-publish-draft",
-      "name": "Medium - Create Draft",
+      "id": "devto-publish-node",
+      "name": "Publish Draft to Dev.to",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [2220, 100],
-      "notes": "Creates a DRAFT on Medium (publishStatus: draft). Change to 'public' to publish immediately."
+      "position": [2250, 100],
+      "notes": "Creates article as DRAFT on Dev.to. Change 'published': true to auto-publish."
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE article_topics\nSET status = 'done',\n    processed_at = NOW(),\n    article_title = '{{ $('Code - Format Article').item.json.article_title.replace(/'/g, \"''\") }}',\n    article_url = '{{ ($('Medium - Create Draft').item.json.data?.url || 'email-only').replace(/'/g, \"''\") }}'\nWHERE id = {{ $('Code - Format Article').item.json.topic_id }}\nRETURNING id, topic, status, processed_at;",
-        "options": {}
+        "query": "UPDATE article_topics\nSET \n  status = 'done',\n  processed_at = NOW(),\n  article_url = {{ $json.url ? \"'\" + $json.url + \"'\" : 'NULL' }}\nWHERE id = {{ $('Parse & Format Article').first().json.topic_id }};",
+        "additionalFields": {}
       },
-      "id": "postgres-mark-done",
-      "name": "PostgreSQL - Mark Done",
+      "id": "mark-done-devto-node",
+      "name": "Mark Done (with Dev.to URL)",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2,
-      "position": [2440, 200],
+      "position": [2500, 100],
       "credentials": {
         "postgres": {
-          "id": "postgres-creds",
+          "id": "postgres-cred",
           "name": "n8n PostgreSQL"
         }
       }
@@ -250,95 +202,170 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE article_topics\nSET status = 'error',\n    retry_count = retry_count + 1,\n    error_message = 'Workflow execution failed'\nWHERE id = {{ $('PostgreSQL - Mark Processing').item.json.id }};",
-        "options": {}
+        "query": "UPDATE article_topics\nSET \n  status = 'done',\n  processed_at = NOW()\nWHERE id = {{ $('Parse & Format Article').first().json.topic_id }};",
+        "additionalFields": {}
       },
-      "id": "postgres-mark-error",
-      "name": "PostgreSQL - Mark Error",
+      "id": "mark-done-node",
+      "name": "Mark Done (email only)",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2,
-      "position": [900, 500],
+      "position": [2250, 350],
       "credentials": {
         "postgres": {
-          "id": "postgres-creds",
+          "id": "postgres-cred",
           "name": "n8n PostgreSQL"
         }
       }
     },
     {
       "parameters": {
-        "content": "## No Topics Available\n\nNo pending topics found in the queue.\nScheduler will check again at the next scheduled run.\n\nTo add topics, POST to:\n`/webhook/submit-topic`",
-        "options": {}
+        "operation": "executeQuery",
+        "query": "UPDATE article_topics\nSET \n  status = CASE WHEN retry_count >= 3 THEN 'failed' ELSE 'pending' END,\n  retry_count = retry_count + 1,\n  error_msg = 'Generation or delivery failed - will retry',\n  scheduled_at = NOW() + INTERVAL '1 hour'\nWHERE id = {{ $('Mark Topic as Processing').first().json[0].id }};",
+        "additionalFields": {}
       },
-      "id": "no-topics-note",
-      "name": "Note - No Topics",
-      "type": "n8n-nodes-base.stickyNote",
+      "id": "handle-error-node",
+      "name": "Handle Error / Retry",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1750, 500],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-cred",
+          "name": "n8n PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "noData"
+      },
+      "id": "no-topic-node",
+      "name": "No Pending Topic - Stop",
+      "type": "n8n-nodes-base.noOp",
       "typeVersion": 1,
-      "position": [680, 480]
+      "position": [1000, 450],
+      "notes": "No pending topics in queue - execution ends gracefully"
     }
   ],
   "connections": {
-    "Schedule - 3x Per Week": {
+    "Schedule: Mon/Wed/Fri 9am": {
       "main": [
-        [{ "node": "PostgreSQL - Fetch Next Topic", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Fetch Next Pending Topic",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "PostgreSQL - Fetch Next Topic": {
+    "Fetch Next Pending Topic": {
       "main": [
-        [{ "node": "IF - Topic Exists?", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Topic Available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "IF - Topic Exists?": {
+    "Topic Available?": {
       "main": [
-        [{ "node": "PostgreSQL - Mark Processing", "type": "main", "index": 0 }],
-        []
+        [
+          {
+            "node": "Mark Topic as Processing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Pending Topic - Stop",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "PostgreSQL - Mark Processing": {
+    "Mark Topic as Processing": {
       "main": [
-        [{ "node": "OpenAI - Generate Article", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Generate Article via LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "OpenAI - Generate Article": {
+    "Generate Article via LLM": {
       "main": [
-        [{ "node": "Code - Format Article", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Parse & Format Article",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Code - Format Article": {
+    "Parse & Format Article": {
       "main": [
-        [{ "node": "Email - Send Article", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Send Article via Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Email - Send Article": {
+    "Send Article via Email": {
       "main": [
-        [{ "node": "IF - Medium Token Set?", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Dev.to Token Available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "IF - Medium Token Set?": {
+    "Dev.to Token Available?": {
       "main": [
-        [{ "node": "Medium - Get User ID", "type": "main", "index": 0 }],
-        [{ "node": "PostgreSQL - Mark Done", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Publish Draft to Dev.to",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Done (email only)",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Medium - Get User ID": {
+    "Publish Draft to Dev.to": {
       "main": [
-        [{ "node": "Medium - Create Draft", "type": "main", "index": 0 }]
-      ]
-    },
-    "Medium - Create Draft": {
-      "main": [
-        [{ "node": "PostgreSQL - Mark Done", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Mark Done (with Dev.to URL)",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     }
   },
   "settings": {
     "executionOrder": "v1",
-    "saveDataSuccessExecution": "none",
-    "saveDataErrorExecution": "all",
     "saveManualExecutions": true,
-    "callerPolicy": "workflowsFromSameOwner",
-    "errorWorkflow": "03 - Error Handler"
+    "errorWorkflow": "3 - Error Handler"
   },
-  "tags": ["article-automation", "scheduled", "publishing"],
-  "notes": "=== SCHEDULED PUBLISHING WORKFLOW ===\n\nSchedule: Mon/Wed/Fri at 08:00\nCron: 0 8 * * 1,3,5\n\nFlow:\n1. Trigger (schedule)\n2. Fetch oldest pending topic from PostgreSQL\n3. Mark as 'processing'\n4. Generate article via OpenAI GPT-4o\n5. Format and extract metadata\n6. Send full article via email\n7. If MEDIUM_TOKEN is set: publish as draft to Medium\n8. Mark topic as 'done'\n\nError handling:\n- If no topic: silently skip\n- If LLM fails: mark topic as 'error', increment retry_count\n- If retry_count >= 3: topic stays as error (manual review needed)\n\nCredentials needed:\n- postgres-creds: PostgreSQL connection\n- openai-creds: OpenAI API key\n- smtp-creds: Gmail/SMTP credentials"
+  "tags": ["article-automation", "publisher", "scheduled"]
 }

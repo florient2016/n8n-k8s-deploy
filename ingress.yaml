@@ -1,8 +1,8 @@
 ---
 # =============================================================================
-# n8n Ingress — HTTPS with TLS termination
-# Uses cert-manager (Let's Encrypt) for automatic certificate management.
-# Change annotations to match your ingress controller (nginx shown here).
+# Ingress: n8n with HTTPS
+# Requires: cert-manager (for TLS) + nginx ingress controller
+# If using a different ingress controller, adjust annotations accordingly
 # =============================================================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -13,56 +13,104 @@ metadata:
     app.kubernetes.io/name: n8n
     app.kubernetes.io/component: ingress
   annotations:
-    # ── nginx ingress ─────────────────────────────────────────────────────────
+    # ----- NGINX Ingress -----
     kubernetes.io/ingress.class: "nginx"
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
-
-    # ── cert-manager (Let's Encrypt) ─────────────────────────────────────────
-    # Use letsencrypt-prod once tested; letsencrypt-staging for initial testing
-    cert-manager.io/cluster-issuer: "letsencrypt-prod"
-
-    # ── WebSocket support (required by n8n) ──────────────────────────────────
+    # WebSocket support (required for n8n live editor)
     nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
     nginx.ingress.kubernetes.io/configuration-snippet: |
       proxy_set_header Upgrade $http_upgrade;
       proxy_set_header Connection "upgrade";
+
+    # ----- cert-manager (Let's Encrypt) -----
+    # CHANGE issuer name to match your cert-manager ClusterIssuer
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
 spec:
   tls:
     - hosts:
-        - n8n.example.com    # ← Change to your domain
-      secretName: n8n-tls-secret
+        - n8n.yourdomain.com      # CHANGE THIS
+      secretName: n8n-tls-cert    # cert-manager will create this secret
   rules:
-    - host: n8n.example.com  # ← Change to your domain
+    - host: n8n.yourdomain.com    # CHANGE THIS
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: n8n
+                name: n8n-svc
                 port:
-                  number: 80
+                  number: 5678
 
 ---
 # =============================================================================
-# ClusterIssuer for cert-manager (Let's Encrypt)
-# Only apply if cert-manager is installed in your cluster.
+# NetworkPolicy: restrict n8n traffic
+# Only allow:
+#   - Ingress controller → n8n-main (port 5678)
+#   - n8n-main/worker → postgres (5432) and redis (6379)
+#   - n8n-main/worker → egress internet (for LLM API calls, email, etc.)
 # =============================================================================
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
 metadata:
-  name: letsencrypt-prod
+  name: n8n-netpol
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
 spec:
-  acme:
-    server: https://acme-v02.api.letsencrypt.org/directory
-    email: your-email@example.com   # ← Change to your email
-    privateKeySecretRef:
-      name: letsencrypt-prod-account-key
-    solvers:
-      - http01:
-          ingress:
-            class: nginx
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: n8n
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Allow ingress controller to reach n8n main
+    - ports:
+        - port: 5678
+    # Allow n8n main and workers to reach each other (queue health checks)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: n8n
+
+  egress:
+    # Allow DNS resolution
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Allow access to postgres
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - port: 5432
+    # Allow access to redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - port: 6379
+    # Allow access to Vault
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault
+      ports:
+        - port: 8200
+    # Allow egress to internet (for LLM API, SMTP, Dev.to, etc.)
+    - ports:
+        - port: 443
+        - port: 587
+        - port: 465
