@@ -1,8 +1,8 @@
 ---
 # =============================================================================
-# StorageClass: standard (local volume on /n8n)
-# Production note: Replace with your cloud provider's storage class in
-# cloud environments (e.g., gp3 on AWS, premium-rwo on GKE)
+# StorageClass: standard
+# Uses local hostPath provisioner — no external CSI driver required.
+# volumeBindingMode: Immediate  ← required when PVCs use label selectors
 # =============================================================================
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -10,25 +10,23 @@ metadata:
   name: standard
   labels:
     app.kubernetes.io/name: n8n
-    app.kubernetes.io/component: storage
 provisioner: kubernetes.io/no-provisioner
-volumeBindingMode: WaitForFirstConsumer
+volumeBindingMode: Immediate
 reclaimPolicy: Retain
 allowVolumeExpansion: true
 
 ---
 # =============================================================================
-# PersistentVolume: n8n-data-pv
-# Local mount on /n8n/n8n-data on the node
+# PersistentVolume: n8n-data-pv  → hostPath /n8n/n8n-data
+# hostPath PVs bind immediately with no nodeAffinity conflicts.
+# type: DirectoryOrCreate creates the path on the node automatically.
 # =============================================================================
 apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: n8n-data-pv
   labels:
-    app.kubernetes.io/name: n8n
-    app.kubernetes.io/component: storage
-    type: n8n-data
+    pv-type: n8n-data
 spec:
   capacity:
     storage: 5Gi
@@ -36,28 +34,20 @@ spec:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
   storageClassName: standard
-  local:
+  hostPath:
     path: /n8n/n8n-data
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: Exists
+    type: DirectoryOrCreate
 
 ---
 # =============================================================================
-# PersistentVolume: n8n-postgres-pv
-# Local mount on /n8n/postgres on the node
+# PersistentVolume: n8n-postgres-pv  → hostPath /n8n/postgres
 # =============================================================================
 apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: n8n-postgres-pv
   labels:
-    app.kubernetes.io/name: n8n
-    app.kubernetes.io/component: storage
-    type: n8n-postgres
+    pv-type: n8n-postgres
 spec:
   capacity:
     storage: 10Gi
@@ -65,28 +55,20 @@ spec:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
   storageClassName: standard
-  local:
+  hostPath:
     path: /n8n/postgres
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: Exists
+    type: DirectoryOrCreate
 
 ---
 # =============================================================================
-# PersistentVolume: n8n-redis-pv
-# Local mount on /n8n/redis on the node
+# PersistentVolume: n8n-redis-pv  → hostPath /n8n/redis
 # =============================================================================
 apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: n8n-redis-pv
   labels:
-    app.kubernetes.io/name: n8n
-    app.kubernetes.io/component: storage
-    type: n8n-redis
+    pv-type: n8n-redis
 spec:
   capacity:
     storage: 2Gi
@@ -94,18 +76,13 @@ spec:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
   storageClassName: standard
-  local:
+  hostPath:
     path: /n8n/redis
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: Exists
+    type: DirectoryOrCreate
 
 ---
 # =============================================================================
-# PersistentVolumeClaim: n8n-data-pvc
+# PVC: n8n-data-pvc  — binds to n8n-data-pv via label selector
 # =============================================================================
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -114,7 +91,6 @@ metadata:
   namespace: n8n
   labels:
     app.kubernetes.io/name: n8n
-    app.kubernetes.io/component: storage
 spec:
   accessModes:
     - ReadWriteOnce
@@ -124,11 +100,11 @@ spec:
       storage: 5Gi
   selector:
     matchLabels:
-      type: n8n-data
+      pv-type: n8n-data
 
 ---
 # =============================================================================
-# PersistentVolumeClaim: n8n-postgres-pvc
+# PVC: n8n-postgres-pvc  — binds to n8n-postgres-pv
 # =============================================================================
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -137,7 +113,6 @@ metadata:
   namespace: n8n
   labels:
     app.kubernetes.io/name: n8n
-    app.kubernetes.io/component: storage
 spec:
   accessModes:
     - ReadWriteOnce
@@ -147,11 +122,11 @@ spec:
       storage: 10Gi
   selector:
     matchLabels:
-      type: n8n-postgres
+      pv-type: n8n-postgres
 
 ---
 # =============================================================================
-# PersistentVolumeClaim: n8n-redis-pvc
+# PVC: n8n-redis-pvc  — binds to n8n-redis-pv
 # =============================================================================
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -160,7 +135,6 @@ metadata:
   namespace: n8n
   labels:
     app.kubernetes.io/name: n8n
-    app.kubernetes.io/component: storage
 spec:
   accessModes:
     - ReadWriteOnce
@@ -170,4 +144,4 @@ spec:
       storage: 2Gi
   selector:
     matchLabels:
-      type: n8n-redis
+      pv-type: n8n-redis

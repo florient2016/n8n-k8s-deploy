@@ -1,6 +1,9 @@
 ---
 # =============================================================================
-# n8n ConfigMap - non-sensitive configuration
+# n8n ConfigMap — non-sensitive config
+# IP placeholders are filled in by scripts/deploy.sh after services exist:
+#   REPLACE_POSTGRES_IP  →  kubectl get svc n8n-postgres-svc -n n8n -o jsonpath='{.spec.clusterIP}'
+#   REPLACE_REDIS_IP     →  kubectl get svc n8n-redis-svc    -n n8n -o jsonpath='{.spec.clusterIP}'
 # =============================================================================
 apiVersion: v1
 kind: ConfigMap
@@ -9,55 +12,48 @@ metadata:
   namespace: n8n
   labels:
     app.kubernetes.io/name: n8n
-    app.kubernetes.io/component: config
 data:
-  # ---- General ----
-  N8N_HOST: "n8n.yourdomain.com"          # CHANGE THIS
+  # ---- n8n core ----
+  N8N_HOST: "n8n.yourdomain.com"             # CHANGE: your domain
   N8N_PORT: "5678"
   N8N_PROTOCOL: "https"
-  WEBHOOK_URL: "https://n8n.yourdomain.com"  # CHANGE THIS
-  GENERIC_TIMEZONE: "Europe/Berlin"          # CHANGE THIS to your timezone
-  TZ: "Europe/Berlin"                        # CHANGE THIS
+  WEBHOOK_URL: "https://n8n.yourdomain.com"  # CHANGE: your domain
+  GENERIC_TIMEZONE: "Europe/Berlin"          # CHANGE: your timezone
+  TZ: "Europe/Berlin"                        # CHANGE: your timezone
+  N8N_USER_FOLDER: "/home/node/.n8n"
+  N8N_LOG_LEVEL: "info"
+  N8N_LOG_OUTPUT: "console"
+  N8N_HIRING_BANNER_ENABLED: "false"
+  EXECUTIONS_DATA_PRUNE: "true"
+  EXECUTIONS_DATA_MAX_AGE: "168"
 
-  # ---- Execution mode: queue ----
+  # ---- Queue mode ----
   EXECUTIONS_MODE: "queue"
-  QUEUE_BULL_REDIS_HOST: "n8n-redis-svc.n8n.svc.cluster.local"
+  QUEUE_BULL_REDIS_HOST: "REPLACE_REDIS_IP"  # Filled by deploy.sh
   QUEUE_BULL_REDIS_PORT: "6379"
+  QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD: "10000"
+  N8N_GRACEFUL_SHUTDOWN_TIMEOUT: "30"
 
   # ---- Database ----
   DB_TYPE: "postgresdb"
-  DB_POSTGRESDB_HOST: "n8n-postgres-svc.n8n.svc.cluster.local"
+  DB_POSTGRESDB_HOST: "REPLACE_POSTGRES_IP"  # Filled by deploy.sh
   DB_POSTGRESDB_PORT: "5432"
   DB_POSTGRESDB_DATABASE: "n8n"
   DB_POSTGRESDB_USER: "n8n"
 
-  # ---- Email (SMTP) ----
+  # ---- SMTP ----
   N8N_EMAIL_MODE: "smtp"
-  N8N_SMTP_HOST: "smtp.gmail.com"           # CHANGE THIS if not Gmail
+  N8N_SMTP_HOST: "smtp.gmail.com"            # CHANGE: your SMTP host
   N8N_SMTP_PORT: "587"
   N8N_SMTP_SSL: "false"
   N8N_SMTP_STARTTLS: "true"
-  N8N_SMTP_SENDER: "your-email@gmail.com"   # CHANGE THIS
-  N8N_SMTP_USER: "your-email@gmail.com"     # CHANGE THIS
-
-  # ---- n8n settings ----
-  N8N_USER_FOLDER: "/home/node/.n8n"
-  N8N_LOG_LEVEL: "info"
-  N8N_LOG_OUTPUT: "console"
-  EXECUTIONS_DATA_PRUNE: "true"
-  EXECUTIONS_DATA_MAX_AGE: "168"           # 7 days in hours
-  N8N_METRICS: "true"
-  N8N_HIRING_BANNER_ENABLED: "false"
-  N8N_VERSION_NOTIFICATIONS_ENABLED: "true"
-
-  # ---- Worker settings ----
-  QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD: "10000"
-  N8N_GRACEFUL_SHUTDOWN_TIMEOUT: "30"
+  N8N_SMTP_SENDER: "you@gmail.com"           # CHANGE: your sender email
+  N8N_SMTP_USER: "you@gmail.com"             # CHANGE: your SMTP user
 
 ---
 # =============================================================================
-# n8n Main Deployment (webhook + UI server)
-# Vault Agent injects all secrets at runtime via emptyDir volume
+# n8n Main Deployment — webhook receiver + UI
+# All sensitive values injected by Vault Agent sidecar
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -66,7 +62,6 @@ metadata:
   namespace: n8n
   labels:
     app.kubernetes.io/name: n8n
-    app.kubernetes.io/instance: n8n-main
     app.kubernetes.io/component: main
 spec:
   replicas: 1
@@ -85,54 +80,54 @@ spec:
         app.kubernetes.io/name: n8n
         app.kubernetes.io/component: main
       annotations:
-        # ---------------------------------------------------------------
-        # Vault Agent Injector - injects ALL secrets as env-formatted files
-        # ---------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Vault Agent injects five secret files into /vault/secrets/
+        # n8n sources them all before starting
+        # ------------------------------------------------------------------
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "n8n"
+        vault.hashicorp.com/agent-pre-populate-only: "false"
+        vault.hashicorp.com/agent-revoke-on-shutdown: "true"
 
-        # n8n core secrets
+        # core (encryption key)
         vault.hashicorp.com/agent-inject-secret-core: "secret/data/n8n/core"
+        vault.hashicorp.com/agent-inject-file-core: "core-env"
         vault.hashicorp.com/agent-inject-template-core: |
           {{- with secret "secret/data/n8n/core" -}}
           export N8N_ENCRYPTION_KEY="{{ .Data.data.encryption_key }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-core: "n8n-core-env"
 
-        # PostgreSQL secrets
-        vault.hashicorp.com/agent-inject-secret-postgres: "secret/data/n8n/postgres"
-        vault.hashicorp.com/agent-inject-template-postgres: |
+        # postgres password
+        vault.hashicorp.com/agent-inject-secret-pg: "secret/data/n8n/postgres"
+        vault.hashicorp.com/agent-inject-file-pg: "pg-env"
+        vault.hashicorp.com/agent-inject-template-pg: |
           {{- with secret "secret/data/n8n/postgres" -}}
           export DB_POSTGRESDB_PASSWORD="{{ .Data.data.password }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-postgres: "n8n-postgres-env"
 
-        # Redis secrets
+        # redis password
         vault.hashicorp.com/agent-inject-secret-redis: "secret/data/n8n/redis"
+        vault.hashicorp.com/agent-inject-file-redis: "redis-env"
         vault.hashicorp.com/agent-inject-template-redis: |
           {{- with secret "secret/data/n8n/redis" -}}
           export QUEUE_BULL_REDIS_PASSWORD="{{ .Data.data.password }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-redis: "n8n-redis-env"
 
-        # SMTP secrets
+        # smtp password
         vault.hashicorp.com/agent-inject-secret-smtp: "secret/data/n8n/smtp"
+        vault.hashicorp.com/agent-inject-file-smtp: "smtp-env"
         vault.hashicorp.com/agent-inject-template-smtp: |
           {{- with secret "secret/data/n8n/smtp" -}}
           export N8N_SMTP_PASS="{{ .Data.data.password }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-smtp: "n8n-smtp-env"
 
-        # LLM API Key
+        # LLM api key + optional dev token
         vault.hashicorp.com/agent-inject-secret-llm: "secret/data/n8n/llm"
+        vault.hashicorp.com/agent-inject-file-llm: "llm-env"
         vault.hashicorp.com/agent-inject-template-llm: |
           {{- with secret "secret/data/n8n/llm" -}}
           export LLM_API_KEY="{{ .Data.data.api_key }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-llm: "n8n-llm-env"
-
-        vault.hashicorp.com/agent-pre-populate-only: "false"
-        vault.hashicorp.com/agent-revoke-on-shutdown: "true"
 
     spec:
       serviceAccountName: n8n-sa
@@ -141,28 +136,53 @@ spec:
         runAsGroup: 1000
         fsGroup: 1000
       initContainers:
-        # Wait for PostgreSQL to be ready before starting n8n
-        - name: wait-for-postgres
+        # Wait until Vault secrets are pre-populated (agent-pre-populate-only phase)
+        - name: wait-vault-secrets
           image: busybox:1.36
           command: ["/bin/sh", "-c"]
           args:
             - |
-              echo "Waiting for PostgreSQL..."
-              until nc -z n8n-postgres-svc 5432; do
+              echo "Waiting for Vault secrets..."
+              for i in $(seq 1 60); do
+                if [ -f /vault/secrets/core-env ] && \
+                   [ -f /vault/secrets/pg-env ]   && \
+                   [ -f /vault/secrets/redis-env ]; then
+                  echo "All Vault secrets present."
+                  exit 0
+                fi
                 sleep 2
               done
-              echo "PostgreSQL is ready."
-        # Wait for Redis to be ready
-        - name: wait-for-redis
+              echo "ERROR: Vault secrets not ready after 120s"
+              exit 1
+          volumeMounts:
+            - name: vault-secrets
+              mountPath: /vault/secrets
+        # Wait for PostgreSQL (by IP — no DNS needed)
+        - name: wait-postgres
           image: busybox:1.36
           command: ["/bin/sh", "-c"]
           args:
             - |
-              echo "Waiting for Redis..."
-              until nc -z n8n-redis-svc 6379; do
-                sleep 2
-              done
-              echo "Redis is ready."
+              PG_IP=$(cat /config/pg-ip)
+              echo "Waiting for PostgreSQL at $PG_IP:5432 ..."
+              until nc -z "$PG_IP" 5432 2>/dev/null; do sleep 2; done
+              echo "PostgreSQL ready."
+          volumeMounts:
+            - name: svc-ips
+              mountPath: /config
+        # Wait for Redis (by IP)
+        - name: wait-redis
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              REDIS_IP=$(cat /config/redis-ip)
+              echo "Waiting for Redis at $REDIS_IP:6379 ..."
+              until nc -z "$REDIS_IP" 6379 2>/dev/null; do sleep 2; done
+              echo "Redis ready."
+          volumeMounts:
+            - name: svc-ips
+              mountPath: /config
       containers:
         - name: n8n
           image: n8nio/n8n:latest
@@ -170,18 +190,17 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              # Source all Vault-injected secret files
-              for f in /vault/secrets/n8n-*-env; do
-                [ -f "$f" ] && source "$f"
+              # Source all Vault-injected env files
+              for f in /vault/secrets/*-env; do
+                [ -f "$f" ] && . "$f"
               done
-              # Start n8n
               exec n8n start
-          ports:
-            - containerPort: 5678
-              name: http
           envFrom:
             - configMapRef:
                 name: n8n-config
+          ports:
+            - name: http
+              containerPort: 5678
           resources:
             requests:
               cpu: "250m"
@@ -198,18 +217,18 @@ spec:
             httpGet:
               path: /healthz
               port: 5678
-            initialDelaySeconds: 60
+            initialDelaySeconds: 90
             periodSeconds: 20
             timeoutSeconds: 10
-            failureThreshold: 3
+            failureThreshold: 5
           readinessProbe:
             httpGet:
               path: /healthz
               port: 5678
-            initialDelaySeconds: 30
+            initialDelaySeconds: 60
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 3
+            failureThreshold: 5
       volumes:
         - name: n8n-data
           persistentVolumeClaim:
@@ -217,10 +236,14 @@ spec:
         - name: vault-secrets
           emptyDir:
             medium: Memory
+        # ConfigMap populated by deploy.sh with actual Service ClusterIPs
+        - name: svc-ips
+          configMap:
+            name: n8n-svc-ips
 
 ---
 # =============================================================================
-# n8n Service (ClusterIP - exposed via Ingress)
+# n8n Service — ClusterIP exposed via Ingress
 # =============================================================================
 apiVersion: v1
 kind: Service
@@ -229,7 +252,6 @@ metadata:
   namespace: n8n
   labels:
     app.kubernetes.io/name: n8n
-    app.kubernetes.io/instance: n8n-main
     app.kubernetes.io/component: main
 spec:
   selector:

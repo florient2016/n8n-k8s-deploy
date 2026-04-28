@@ -1,6 +1,6 @@
 ---
 # =============================================================================
-# Redis ConfigMap - redis.conf template
+# Redis ConfigMap
 # =============================================================================
 apiVersion: v1
 kind: ConfigMap
@@ -8,44 +8,26 @@ metadata:
   name: n8n-redis-config
   namespace: n8n
   labels:
-    app.kubernetes.io/name: redis
-    app.kubernetes.io/instance: n8n-redis
+    app.kubernetes.io/name: n8n-redis
 data:
   redis.conf: |
-    # Network
     bind 0.0.0.0
     protected-mode yes
     port 6379
-
-    # Persistence (AOF for durability)
     appendonly yes
     appendfilename "appendonly.aof"
     appendfsync everysec
-    auto-aof-rewrite-percentage 100
-    auto-aof-rewrite-min-size 64mb
-
-    # Memory
     maxmemory 256mb
     maxmemory-policy allkeys-lru
-
-    # Logging
-    loglevel notice
-    logfile ""
-
-    # Security: password injected at startup via Vault
-    # requirepass set via --requirepass CLI arg
-
-    # Timeouts
     timeout 300
     tcp-keepalive 60
-
-    # Persistence directory
+    loglevel notice
     dir /data
 
 ---
 # =============================================================================
 # Redis Deployment
-# Password injected from Vault at runtime
+# Password sourced from Vault-injected file at startup
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -53,8 +35,7 @@ metadata:
   name: n8n-redis
   namespace: n8n
   labels:
-    app.kubernetes.io/name: redis
-    app.kubernetes.io/instance: n8n-redis
+    app.kubernetes.io/name: n8n-redis
     app.kubernetes.io/component: cache
 spec:
   replicas: 1
@@ -67,23 +48,20 @@ spec:
     metadata:
       labels:
         app: n8n-redis
-        app.kubernetes.io/name: redis
-        app.kubernetes.io/component: cache
+        app.kubernetes.io/name: n8n-redis
       annotations:
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "n8n"
+        vault.hashicorp.com/agent-pre-populate-only: "true"
         vault.hashicorp.com/agent-inject-secret-redis: "secret/data/n8n/redis"
+        vault.hashicorp.com/agent-inject-file-redis: "redis-password"
         vault.hashicorp.com/agent-inject-template-redis: |
           {{- with secret "secret/data/n8n/redis" -}}
           {{ .Data.data.password }}
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-redis: "redis-password"
-        vault.hashicorp.com/agent-pre-populate-only: "true"
     spec:
       serviceAccountName: n8n-sa
       securityContext:
-        runAsUser: 999
-        runAsGroup: 999
         fsGroup: 999
       containers:
         - name: redis
@@ -92,11 +70,16 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              REDIS_PASSWORD=$(cat /vault/secrets/redis-password | tr -d '\n')
+              for i in $(seq 1 30); do
+                [ -f /vault/secrets/redis-password ] && break
+                echo "Waiting for Vault secret... ($i)"
+                sleep 2
+              done
+              REDIS_PASSWORD=$(cat /vault/secrets/redis-password | tr -d '[:space:]')
               exec redis-server /etc/redis/redis.conf --requirepass "$REDIS_PASSWORD"
           ports:
-            - containerPort: 6379
-              name: redis
+            - name: redis
+              containerPort: 6379
           resources:
             requests:
               cpu: "100m"
@@ -117,21 +100,24 @@ spec:
                 - /bin/sh
                 - -c
                 - |
-                  PASS=$(cat /vault/secrets/redis-password | tr -d '\n')
-                  redis-cli -a "$PASS" ping | grep PONG
-            initialDelaySeconds: 15
+                  PASS=$(cat /vault/secrets/redis-password | tr -d '[:space:]')
+                  redis-cli -a "$PASS" ping 2>/dev/null | grep -q PONG
+            initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
+            failureThreshold: 5
           readinessProbe:
             exec:
               command:
                 - /bin/sh
                 - -c
                 - |
-                  PASS=$(cat /vault/secrets/redis-password | tr -d '\n')
-                  redis-cli -a "$PASS" ping | grep PONG
-            initialDelaySeconds: 5
+                  PASS=$(cat /vault/secrets/redis-password | tr -d '[:space:]')
+                  redis-cli -a "$PASS" ping 2>/dev/null | grep -q PONG
+            initialDelaySeconds: 10
             periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 5
       volumes:
         - name: n8n-redis-data
           persistentVolumeClaim:
@@ -145,7 +131,8 @@ spec:
 
 ---
 # =============================================================================
-# Redis Service (ClusterIP - internal only)
+# Redis Service — ClusterIP
+# Get IP after apply: kubectl get svc n8n-redis-svc -n n8n -o jsonpath='{.spec.clusterIP}'
 # =============================================================================
 apiVersion: v1
 kind: Service
@@ -153,8 +140,7 @@ metadata:
   name: n8n-redis-svc
   namespace: n8n
   labels:
-    app.kubernetes.io/name: redis
-    app.kubernetes.io/instance: n8n-redis
+    app.kubernetes.io/name: n8n-redis
     app.kubernetes.io/component: cache
 spec:
   selector:

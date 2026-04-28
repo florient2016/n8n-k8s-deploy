@@ -1,6 +1,6 @@
 ---
 # =============================================================================
-# PostgreSQL ConfigMap - init scripts
+# PostgreSQL ConfigMap — init SQL (creates n8n DB, user, topic queue table)
 # =============================================================================
 apiVersion: v1
 kind: ConfigMap
@@ -8,43 +8,35 @@ metadata:
   name: n8n-postgres-init
   namespace: n8n
   labels:
-    app.kubernetes.io/name: postgres
-    app.kubernetes.io/instance: n8n-postgres
+    app.kubernetes.io/name: n8n-postgres
 data:
-  init.sql: |
-    -- Create n8n database and user (password set via env from Vault)
-    CREATE DATABASE n8n;
-    CREATE USER n8n WITH ENCRYPTED PASSWORD :'POSTGRES_PASSWORD';
-    GRANT ALL PRIVILEGES ON DATABASE n8n TO n8n;
-    ALTER USER n8n CREATEDB;
-
-    -- Topic queue table for the automation workflow
-    \connect n8n
-    
-    CREATE TABLE IF NOT EXISTS article_topics (
-        id          SERIAL PRIMARY KEY,
-        topic       TEXT        NOT NULL,
-        status      VARCHAR(20) NOT NULL DEFAULT 'pending',
-        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        scheduled_at TIMESTAMPTZ,
-        processed_at TIMESTAMPTZ,
-        article_url TEXT,
-        error_msg   TEXT,
-        retry_count INT         NOT NULL DEFAULT 0,
-        CONSTRAINT status_check CHECK (status IN ('pending','processing','done','failed'))
-    );
-    
-    CREATE INDEX idx_topics_status    ON article_topics(status);
-    CREATE INDEX idx_topics_created   ON article_topics(created_at);
-    CREATE INDEX idx_topics_scheduled ON article_topics(scheduled_at);
-    
-    COMMENT ON TABLE  article_topics IS 'Queue of article topics for n8n scheduled publishing';
-    COMMENT ON COLUMN article_topics.status IS 'pending|processing|done|failed';
+  01-init.sh: |
+    #!/bin/bash
+    set -e
+    # POSTGRES_PASSWORD is exported by the entrypoint wrapper below
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+      CREATE TABLE IF NOT EXISTS article_topics (
+          id           SERIAL PRIMARY KEY,
+          topic        TEXT        NOT NULL,
+          status       VARCHAR(20) NOT NULL DEFAULT 'pending',
+          created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          scheduled_at TIMESTAMPTZ,
+          processed_at TIMESTAMPTZ,
+          article_url  TEXT,
+          error_msg    TEXT,
+          retry_count  INT         NOT NULL DEFAULT 0,
+          CONSTRAINT   status_chk  CHECK (status IN ('pending','processing','done','failed'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_topics_status  ON article_topics(status);
+      CREATE INDEX IF NOT EXISTS idx_topics_created ON article_topics(created_at);
+    EOSQL
 
 ---
 # =============================================================================
 # PostgreSQL Deployment
-# Vault Agent sidecar injects DB password at runtime via annotation
+# - Vault Agent injects password into /vault/secrets/pg-env
+# - Entrypoint wrapper sources the file before running postgres
+# - NO DNS hostnames used for self-reference; pod uses localhost
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -52,8 +44,7 @@ metadata:
   name: n8n-postgres
   namespace: n8n
   labels:
-    app.kubernetes.io/name: postgres
-    app.kubernetes.io/instance: n8n-postgres
+    app.kubernetes.io/name: n8n-postgres
     app.kubernetes.io/component: database
 spec:
   replicas: 1
@@ -61,60 +52,47 @@ spec:
     matchLabels:
       app: n8n-postgres
   strategy:
-    type: Recreate        # Required for single-node PVC
+    type: Recreate
   template:
     metadata:
       labels:
         app: n8n-postgres
-        app.kubernetes.io/name: postgres
-        app.kubernetes.io/component: database
+        app.kubernetes.io/name: n8n-postgres
       annotations:
-        # ---------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Vault Agent Injector annotations
-        # ---------------------------------------------------------------
+        # ------------------------------------------------------------------
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "n8n"
-        vault.hashicorp.com/agent-inject-secret-postgres: "secret/data/n8n/postgres"
-        vault.hashicorp.com/agent-inject-template-postgres: |
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        # Render postgres password as a shell-sourceable env file
+        vault.hashicorp.com/agent-inject-secret-pg: "secret/data/n8n/postgres"
+        vault.hashicorp.com/agent-inject-file-pg: "pg-env"
+        vault.hashicorp.com/agent-inject-template-pg: |
           {{- with secret "secret/data/n8n/postgres" -}}
           export POSTGRES_PASSWORD="{{ .Data.data.password }}"
-          export PGPASSWORD="{{ .Data.data.password }}"
           {{- end }}
-        vault.hashicorp.com/agent-pre-populate-only: "true"
-        vault.hashicorp.com/agent-inject-file-postgres: "postgres-env"
     spec:
       serviceAccountName: n8n-sa
+      # Run as root so postgres can manage /n8n/postgres ownership
       securityContext:
-        runAsUser: 999
-        runAsGroup: 999
         fsGroup: 999
-      initContainers:
-        # Source Vault-injected env file before init
-        - name: vault-env-sourcer
-          image: busybox:1.36
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              while [ ! -f /vault/secrets/postgres-env ]; do
-                echo "Waiting for Vault secrets..."
-                sleep 2
-              done
-              echo "Vault secrets ready."
-          volumeMounts:
-            - name: vault-secrets
-              mountPath: /vault/secrets
       containers:
         - name: postgres
           image: postgres:15-alpine
           imagePullPolicy: IfNotPresent
+          # Source Vault env file then hand off to the real entrypoint
           command: ["/bin/sh", "-c"]
           args:
             - |
-              source /vault/secrets/postgres-env
+              # Wait for Vault agent to write the secret file
+              for i in $(seq 1 30); do
+                [ -f /vault/secrets/pg-env ] && break
+                echo "Waiting for Vault secret... ($i)"
+                sleep 2
+              done
+              source /vault/secrets/pg-env
               exec docker-entrypoint.sh postgres
-          ports:
-            - containerPort: 5432
-              name: postgres
           env:
             - name: POSTGRES_DB
               value: "n8n"
@@ -122,6 +100,9 @@ spec:
               value: "n8n"
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
           resources:
             requests:
               cpu: "250m"
@@ -139,16 +120,17 @@ spec:
           livenessProbe:
             exec:
               command: ["pg_isready", "-U", "n8n", "-d", "n8n"]
-            initialDelaySeconds: 30
+            initialDelaySeconds: 45
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 3
+            failureThreshold: 5
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "n8n", "-d", "n8n"]
-            initialDelaySeconds: 5
+            initialDelaySeconds: 10
             periodSeconds: 5
             timeoutSeconds: 3
+            failureThreshold: 5
       volumes:
         - name: n8n-postgres-data
           persistentVolumeClaim:
@@ -156,13 +138,16 @@ spec:
         - name: init-scripts
           configMap:
             name: n8n-postgres-init
+            defaultMode: 0755
         - name: vault-secrets
           emptyDir:
-            medium: Memory    # Keep secrets in RAM only
+            medium: Memory
 
 ---
 # =============================================================================
-# PostgreSQL Service (ClusterIP - internal only)
+# PostgreSQL Service — ClusterIP
+# Other pods connect using the ClusterIP, not DNS, per user requirement.
+# After apply: kubectl get svc n8n-postgres-svc -n n8n -o jsonpath='{.spec.clusterIP}'
 # =============================================================================
 apiVersion: v1
 kind: Service
@@ -170,8 +155,7 @@ metadata:
   name: n8n-postgres-svc
   namespace: n8n
   labels:
-    app.kubernetes.io/name: postgres
-    app.kubernetes.io/instance: n8n-postgres
+    app.kubernetes.io/name: n8n-postgres
     app.kubernetes.io/component: database
 spec:
   selector:

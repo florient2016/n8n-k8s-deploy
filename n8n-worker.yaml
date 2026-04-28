@@ -1,8 +1,8 @@
 ---
 # =============================================================================
 # n8n Worker Deployment
-# Workers process jobs from the Redis queue (queue mode)
-# Scale replicas independently from the main n8n instance
+# Processes jobs from the Redis Bull queue (EXECUTIONS_MODE=queue)
+# Workers are stateless — no PVC needed
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -11,10 +11,9 @@ metadata:
   namespace: n8n
   labels:
     app.kubernetes.io/name: n8n
-    app.kubernetes.io/instance: n8n-worker
     app.kubernetes.io/component: worker
 spec:
-  replicas: 2          # Start with 2 workers, scale as needed
+  replicas: 2
   selector:
     matchLabels:
       app: n8n-worker
@@ -32,44 +31,43 @@ spec:
       annotations:
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "n8n"
+        vault.hashicorp.com/agent-pre-populate-only: "false"
+        vault.hashicorp.com/agent-revoke-on-shutdown: "true"
 
         vault.hashicorp.com/agent-inject-secret-core: "secret/data/n8n/core"
+        vault.hashicorp.com/agent-inject-file-core: "core-env"
         vault.hashicorp.com/agent-inject-template-core: |
           {{- with secret "secret/data/n8n/core" -}}
           export N8N_ENCRYPTION_KEY="{{ .Data.data.encryption_key }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-core: "n8n-core-env"
 
-        vault.hashicorp.com/agent-inject-secret-postgres: "secret/data/n8n/postgres"
-        vault.hashicorp.com/agent-inject-template-postgres: |
+        vault.hashicorp.com/agent-inject-secret-pg: "secret/data/n8n/postgres"
+        vault.hashicorp.com/agent-inject-file-pg: "pg-env"
+        vault.hashicorp.com/agent-inject-template-pg: |
           {{- with secret "secret/data/n8n/postgres" -}}
           export DB_POSTGRESDB_PASSWORD="{{ .Data.data.password }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-postgres: "n8n-postgres-env"
 
         vault.hashicorp.com/agent-inject-secret-redis: "secret/data/n8n/redis"
+        vault.hashicorp.com/agent-inject-file-redis: "redis-env"
         vault.hashicorp.com/agent-inject-template-redis: |
           {{- with secret "secret/data/n8n/redis" -}}
           export QUEUE_BULL_REDIS_PASSWORD="{{ .Data.data.password }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-redis: "n8n-redis-env"
 
         vault.hashicorp.com/agent-inject-secret-smtp: "secret/data/n8n/smtp"
+        vault.hashicorp.com/agent-inject-file-smtp: "smtp-env"
         vault.hashicorp.com/agent-inject-template-smtp: |
           {{- with secret "secret/data/n8n/smtp" -}}
           export N8N_SMTP_PASS="{{ .Data.data.password }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-smtp: "n8n-smtp-env"
 
         vault.hashicorp.com/agent-inject-secret-llm: "secret/data/n8n/llm"
+        vault.hashicorp.com/agent-inject-file-llm: "llm-env"
         vault.hashicorp.com/agent-inject-template-llm: |
           {{- with secret "secret/data/n8n/llm" -}}
           export LLM_API_KEY="{{ .Data.data.api_key }}"
           {{- end }}
-        vault.hashicorp.com/agent-inject-file-llm: "n8n-llm-env"
-
-        vault.hashicorp.com/agent-pre-populate-only: "false"
-        vault.hashicorp.com/agent-revoke-on-shutdown: "true"
 
     spec:
       serviceAccountName: n8n-sa
@@ -78,20 +76,32 @@ spec:
         runAsGroup: 1000
         fsGroup: 1000
       initContainers:
-        - name: wait-for-postgres
+        - name: wait-postgres
           image: busybox:1.36
           command: ["/bin/sh", "-c"]
           args:
             - |
-              until nc -z n8n-postgres-svc 5432; do sleep 2; done
+              PG_IP=$(cat /config/pg-ip)
+              until nc -z "$PG_IP" 5432 2>/dev/null; do
+                echo "Waiting for PostgreSQL at $PG_IP..."; sleep 3
+              done
               echo "PostgreSQL ready."
-        - name: wait-for-redis
+          volumeMounts:
+            - name: svc-ips
+              mountPath: /config
+        - name: wait-redis
           image: busybox:1.36
           command: ["/bin/sh", "-c"]
           args:
             - |
-              until nc -z n8n-redis-svc 6379; do sleep 2; done
+              REDIS_IP=$(cat /config/redis-ip)
+              until nc -z "$REDIS_IP" 6379 2>/dev/null; do
+                echo "Waiting for Redis at $REDIS_IP..."; sleep 3
+              done
               echo "Redis ready."
+          volumeMounts:
+            - name: svc-ips
+              mountPath: /config
       containers:
         - name: n8n-worker
           image: n8nio/n8n:latest
@@ -99,18 +109,13 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              for f in /vault/secrets/n8n-*-env; do
-                [ -f "$f" ] && source "$f"
+              for f in /vault/secrets/*-env; do
+                [ -f "$f" ] && . "$f"
               done
-              # Worker mode: processes jobs from queue, no UI
               exec n8n worker
           envFrom:
             - configMapRef:
                 name: n8n-config
-          env:
-            # Workers don't serve the UI or webhooks
-            - name: N8N_DISABLE_UI
-              value: "true"
           resources:
             requests:
               cpu: "200m"
@@ -119,37 +124,30 @@ spec:
               cpu: "1000m"
               memory: "2Gi"
           volumeMounts:
-            - name: n8n-worker-data
-              mountPath: /home/node/.n8n
             - name: vault-secrets
               mountPath: /vault/secrets
-          livenessProbe:
-            exec:
-              command: ["n8n", "--version"]
-            initialDelaySeconds: 30
-            periodSeconds: 30
-            timeoutSeconds: 10
-            failureThreshold: 3
+            - name: worker-tmp
+              mountPath: /home/node/.n8n
       volumes:
-        - name: n8n-worker-data
-          emptyDir: {}       # Workers are stateless; state lives in Postgres+Redis
         - name: vault-secrets
           emptyDir:
             medium: Memory
+        - name: worker-tmp
+          emptyDir: {}
+        - name: svc-ips
+          configMap:
+            name: n8n-svc-ips
 
 ---
 # =============================================================================
-# HorizontalPodAutoscaler for n8n workers
-# Scale based on CPU to handle bursts of workflow execution
+# HPA — auto-scale workers between 2 and 5 replicas
+# Requires metrics-server in the cluster
 # =============================================================================
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: n8n-worker-hpa
   namespace: n8n
-  labels:
-    app.kubernetes.io/name: n8n
-    app.kubernetes.io/component: worker
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -164,9 +162,3 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 80

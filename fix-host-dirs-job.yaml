@@ -1,0 +1,55 @@
+---
+# =============================================================================
+# One-shot Job: create hostPath directories on the node
+# Run this if PVCs stay in Pending: kubectl apply -f k8s/storage/fix-host-dirs-job.yaml
+# Uses privileged hostPID + hostPath to write to the node filesystem
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: n8n-create-host-dirs
+  namespace: n8n
+  labels:
+    app.kubernetes.io/name: n8n
+    app.kubernetes.io/component: storage-init
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      hostPID: true
+      tolerations:
+        - operator: Exists   # run on any node (including control-plane)
+      containers:
+        - name: create-dirs
+          image: busybox:1.36
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Creating n8n host directories on node..."
+              mkdir -p /host/n8n/n8n-data
+              mkdir -p /host/n8n/postgres
+              mkdir -p /host/n8n/redis
+
+              # postgres runs as uid 999
+              chown -R 999:999 /host/n8n/postgres
+              chown -R 999:999 /host/n8n/redis
+              # n8n runs as uid 1000
+              chown -R 1000:1000 /host/n8n/n8n-data
+
+              chmod 750 /host/n8n/postgres
+              chmod 750 /host/n8n/redis
+              chmod 755 /host/n8n/n8n-data
+
+              echo "Directories:"
+              ls -la /host/n8n/
+              echo "Done."
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
